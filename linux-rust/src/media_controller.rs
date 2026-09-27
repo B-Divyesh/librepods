@@ -13,7 +13,6 @@ use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,12 +138,24 @@ impl MediaController {
             drop(state);
 
             if !was_playing && is_playing {
-                let aacp_state = aacp_manager.state.lock().await;
-                if !aacp_state
-                    .ear_detection_status
-                    .contains(&EarDetectionStatus::InEar)
-                {
+                // Copy what we need and release the AACP lock right away: the
+                // send_* calls below take the same lock (upstream deadlocked here
+                // whenever the buds reported a second host such as an iPhone).
+                let (in_ear, connected_devices) = {
+                    let aacp_state = aacp_manager.state.lock().await;
+                    (
+                        aacp_state
+                            .ear_detection_status
+                            .contains(&EarDetectionStatus::InEar),
+                        aacp_state.connected_devices.clone(),
+                    )
+                };
+                if !in_ear {
                     info!("Media playback started but buds not in ear, skipping takeover");
+                    continue;
+                }
+                if !crate::utils::app_setting("media_takeover", true) {
+                    debug!("Automatic switching disabled, not taking over");
                     continue;
                 }
                 info!("Media playback started, taking ownership and activating a2dp");
@@ -156,7 +167,6 @@ impl MediaController {
 
                 info!("already connected locally, hijacking connection by asking AirPods");
 
-                let connected_devices = aacp_state.connected_devices.clone();
                 for device in connected_devices {
                     if device.mac != local_mac {
                         if let Err(e) = aacp_manager
@@ -346,9 +356,10 @@ impl MediaController {
 
     async fn restart_wire_plumber(&self) -> bool {
         info!("Restarting WirePlumber to rediscover A2DP profiles");
-        let result = Command::new("systemctl")
+        let result = tokio::process::Command::new("systemctl")
             .args(["--user", "restart", "wireplumber"])
-            .output();
+            .output()
+            .await;
 
         match result {
             Ok(output) if output.status.success() => {
@@ -618,11 +629,9 @@ impl MediaController {
             None => return String::new(),
         };
 
-        if !cached_profile.is_empty() && self.is_profile_available(index, &cached_profile).await {
-            debug!("Using cached A2DP profile: {}", cached_profile);
-            return cached_profile;
-        }
-
+        // The preferred codec is re-read every time so a change in settings
+        // applies on the next activation instead of sticking to a cached pick.
+        let _ = cached_profile;
         for profile in crate::utils::load_preferred_codec().profile_order() {
             if self.is_profile_available(index, profile).await {
                 info!("Selected best available A2DP profile: {}", profile);
@@ -930,7 +939,7 @@ fn pulse_connect() -> Option<(Mainloop, Context)> {
     let mut context = Context::new(&mainloop, "LibrePods")?;
     context.connect(None, ContextFlagSet::NOAUTOSPAWN, None).ok()?;
     loop {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
         match context.get_state() {
             libpulse_binding::context::State::Ready => break,
             libpulse_binding::context::State::Failed
@@ -975,7 +984,7 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
     });
 
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
     mainloop.quit(Retval(0));
     Rc::try_unwrap(cards).unwrap().into_inner()
@@ -998,7 +1007,7 @@ fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
         }
     });
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
     mainloop.quit(Retval(0));
 
@@ -1013,6 +1022,28 @@ fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
     Some(percent)
 }
 
+/// Switch a connected AirPods card to the codec chosen in settings, if it is
+/// playing over a different A2DP codec right now. Blocking; call off the runtime.
+pub fn apply_preferred_codec_sync(mac: &str) -> Option<String> {
+    let card = get_card_info_list_sync().into_iter().find(|c| {
+        c.proplist
+            .get_str("device.string")
+            .is_some_and(|d| d.eq_ignore_ascii_case(mac))
+    })?;
+    let active = card.active_profile.clone().unwrap_or_default();
+    if !active.starts_with("a2dp") {
+        return None;
+    }
+    let target = crate::utils::load_preferred_codec()
+        .profile_order()
+        .into_iter()
+        .find(|p| card.profiles.iter().any(|cp| cp.name.as_deref() == Some(*p)))?;
+    if target == active {
+        return None;
+    }
+    set_card_profile_sync(card.index, target).then(|| target.to_string())
+}
+
 fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
     let (mut mainloop, context) = match pulse_connect() {
         Some(c) => c,
@@ -1021,7 +1052,7 @@ fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
     let mut introspector = context.introspect();
     let op = introspector.set_card_profile_by_index(card_index, profile_name, None);
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
     mainloop.quit(Retval(0));
     true
@@ -1047,7 +1078,7 @@ pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
         }
     });
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
 
     if let Some(info) = sink_info.borrow().as_ref() {
@@ -1059,7 +1090,7 @@ pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
 
         let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
         while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
+            mainloop.iterate(true);
         }
         mainloop.quit(Retval(0));
         true
@@ -1092,7 +1123,7 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
             }
         });
         while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
+            mainloop.iterate(true);
         }
         mainloop.quit(Retval(0));
 
