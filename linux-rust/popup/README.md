@@ -121,6 +121,67 @@ outside a surface.
 Touchscreen taps work too, and the pointer turns into a hand over the
 buttons (cursor-shape-v1).
 
+## Bar dropdown (menu)
+
+Clicking the Waybar AirPods icon opens a small macOS-style menu that hangs
+under the icon, like the Sound/AirPods menu in Control Center. Clicking the
+icon again (or anywhere else) closes it. The daemon triggers it with a
+`menu` event (`librepods ctl menu`) that carries `anchor_x`, the clicked
+icon's x in logical px. If `anchor_x` is `null` or missing, the menu opens
+at the right edge.
+
+From top to bottom:
+
+1. **Header:** device name, then "Connected" (blue), "On another device" or
+   "Not connected". The glyph is earbuds, or headphones for AirPods Max.
+2. **Batteries:** Left / Right / Case (just Battery for Max), each a small
+   ring with its percentage and a bolt when charging.
+3. **Listening Mode:** round buttons, amber when selected. The choices are
+   Off (only if `allow_off`), Noise Cancellation, Transparency, and
+   Adaptive (Pro 2/3 and AirPods 4 ANC, or when `model_id` is unknown).
+   Clicking sends `mode off|anc|transparency|adaptive`. The highlight moves
+   right away, and the next status line confirms it. The menu stays open.
+4. **Conversation Awareness** switch: sends `ca on` / `ca off`, and the
+   menu stays open. When the AirPods aren't connected, sections 3–4 are
+   dimmed and inactive, with the hint "Connect to change listening mode".
+5. **Menu rows:**
+   * **Connect / Disconnect:** sends `connect` or `disconnect`.
+   * **Bluetooth Settings…:** runs `alacritty --class floatterm -e bluetui`,
+     detached.
+   * **AirPods Settings…:** sends `open`.
+
+   Each row closes the menu.
+
+While the menu is open, it updates live from status lines.
+
+**Placement and input.**
+
+* The panel is 340 px wide, with its top 44 px below the top of the output
+  (the bar is 32 px tall with a 6 px margin). It's centred on `anchor_x`
+  and kept 10 px from the screen edges.
+* `anchor_x` may be global layout coordinates: on a monitor that isn't at
+  x = 0, values past the output's width are shifted by the monitor's
+  position.
+* The layer surface (`librepods-menu`, overlay, anchored to all four edges,
+  `exclusive_zone -1`) covers the whole output, bar included. So any click
+  outside the panel closes the menu and is swallowed, like a real menu.
+* The surface costs 4 bytes: one transparent pixel stretched by
+  `wp_viewporter`. The panel is a small subsurface on top of it.
+* The menu takes the keyboard exclusively while open (Escape closes it) and
+  lets go as soon as it starts fading out.
+* It fades in with a 6 px drop over 120 ms, and it redraws only on input or
+  animation. The case-open card and the menu can be up at the same time.
+
+A matching layer rule:
+
+```lua
+hl.layer_rule({ name = "librepods-menu", match = { namespace = "^(librepods-menu)$" },
+                blur = true, ignore_alpha = 0.3, no_anim = true })
+```
+
+The panel is 95 % opaque. Its shadow stays under alpha 0.3, and the rest of
+the surface is fully transparent, so the blur only lands behind the panel.
+
 ## Protocol
 
 Socket: `$XDG_RUNTIME_DIR/librepods.sock` (override with `--socket PATH`).
@@ -139,7 +200,13 @@ connect card is disabled, those events arrive renamed to `status`.
  "lid_open":true,"listening_mode":"anc","conversational_awareness":true,"auto_connect":true}
 ```
 
-* `event`: `status | lid_open | lid_close | connected | disconnected | connecting | connect_failed | mode | low_battery | popup`.
+* `event`: `status | lid_open | lid_close | connected | disconnected | connecting | connect_failed | mode | low_battery | popup | menu`.
+  A `menu` line also carries `"anchor_x": <int | null>`.
+* Fields the menu uses: `listening_mode` (`off | anc | transparency | adaptive`),
+  `conversational_awareness`, `allow_off`, `in_ear`. An optional
+  `connected_elsewhere: true` makes the header say "On another device".
+  Without that field, the menu assumes buds that are in an ear but not
+  connected here are playing from another device.
 * Only the keys present in a line are applied, so partial objects are fine.
   A key sent as `null` means unknown and clears the old value.
 * Battery levels are 0–100. Anything else (`-1`, `255`) counts as unknown.
@@ -157,6 +224,7 @@ reply line:
 |-------------|-----------------------------------------|
 | `connect\n` | `{"ok":true}` or `{"ok":false,"error":"…"}` |
 | `open\n`    | (read and ignored)                      |
+| `disconnect\n`, `mode anc\n`, `ca on\n`, … | (read and ignored)    |
 
 ## Options
 
@@ -170,6 +238,10 @@ reply line:
 --backdrop        --dump onto a sample wallpaper instead of transparency
 --font FAMILY     preferred font [default: Inter, else SF Pro, Noto Sans, embedded Noto]
 --margin PX       extra gap above the bottom edge [default: 0; the card already sits 24 px up]
+--menu            with --demo/--dump: the bar dropdown instead of the card
+                  (--demo --menu closes itself after 4.5 s)
+--anchor X        with --demo --menu: icon x in logical px
+--hover ITEM      with --dump --menu: draw mode:N, ca or row:N hovered
 -v, --verbose     log events and decisions to stderr
 ```
 
@@ -202,11 +274,13 @@ reply line:
 ## Layout
 
 ```
-src/main.rs      CLI, state machine (show/hide/connect), poll loop
+src/main.rs      CLI, state machine (card, menu, connect), poll loop
 src/protocol.rs  JSON event model, product ids, ring selection
 src/ipc.rs       watch stream + connect/open commands
-src/wayland.rs   layer-shell surface, shm buffers, input, scaling
+src/wayland.rs   layer-shell surfaces (card, menu + panel subsurface), shm buffers, input, scaling
 src/render.rs    card layout, rings, button, shadow, compositing
+src/menu.rs      bar dropdown: placement, layout, hit-testing, rendering
+src/theme.rs     Ember palette
 src/art.rs       product illustrations
 src/text.rs      font discovery, shaping, glyph rasterisation
 src/draw.rs      tiny-skia helpers, continuous-corner rect, blur

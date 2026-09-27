@@ -613,6 +613,7 @@ struct WireStatus {
     connected: bool,
     bluetooth_on: bool,
     nearby: bool,
+    #[serde(alias = "connected_elsewhere")]
     other_host: bool,
     name: Option<String>,
     model: Option<String>,

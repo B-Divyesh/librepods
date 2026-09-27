@@ -413,6 +413,15 @@ async fn handle_frame(
             s.in_ear.left = Some(adv.in_ear_left);
             s.in_ear.right = Some(adv.in_ear_right);
         }
+        if s.connected {
+            // Fill gaps until the control channel reports its own levels.
+            if s.left.is_none() {
+                s.left = adv.left;
+            }
+            if s.right.is_none() {
+                s.right = adv.right;
+            }
+        }
         if adv.case.is_some() {
             s.case = adv.case;
         }

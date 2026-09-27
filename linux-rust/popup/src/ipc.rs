@@ -136,6 +136,8 @@ impl Watch {
 pub enum CmdKind {
     Connect,
     Open,
+    /// `disconnect`, `mode …`, `ca …`: fire and forget.
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,13 +155,12 @@ pub struct Cmd {
     pub deadline: Instant,
 }
 
-pub fn send(path: &Path, kind: CmdKind, timeout: Duration) -> io::Result<Cmd> {
+/// Send one command line (`connect`, `open`, `mode anc`, `ca on`, …) on
+/// its own connection.
+pub fn send(path: &Path, kind: CmdKind, line: &str, timeout: Duration) -> io::Result<Cmd> {
     let mut s = UnixStream::connect(path)?;
     s.set_write_timeout(Some(Duration::from_secs(1)))?;
-    s.write_all(match kind {
-        CmdKind::Connect => b"connect\n",
-        CmdKind::Open => b"open\n",
-    })?;
+    s.write_all(format!("{}\n", line.trim()).as_bytes())?;
     s.set_nonblocking(true)?;
     Ok(Cmd {
         kind,

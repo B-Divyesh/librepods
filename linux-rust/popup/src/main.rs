@@ -16,9 +16,11 @@ mod art;
 mod draw;
 mod ipc;
 mod lock;
+mod menu;
 mod protocol;
 mod render;
 mod text;
+mod theme;
 mod wayland;
 
 use std::io;
@@ -33,7 +35,8 @@ use art::Led;
 use ipc::{Cmd, CmdKind, Reply, Watch};
 use protocol::{Batt, Device, Event, RingId};
 use render::{ButtonKind, Hit, Pose, Press, Renderer, RingView, View};
-use wayland::{BTN_LEFT, BTN_RIGHT, Cursor, Input, Wl};
+use menu::{MenuHit, MenuRenderer, MenuView, Row};
+use wayland::{BTN_LEFT, BTN_RIGHT, Cursor, Input, KEY_ESC, Target, Wl};
 
 pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 
@@ -61,6 +64,10 @@ const RING_UPDATE: Duration = Duration::from_millis(450);
 /// Draw anyway if the compositor sends no frame callback (output off).
 const FRAME_FALLBACK: Duration = Duration::from_millis(100);
 const LOCK_CACHE: Duration = Duration::from_secs(1);
+/// Menu fade + drop, in and out.
+const MENU_FADE: Duration = Duration::from_millis(120);
+/// `--demo --menu` closes itself after this long.
+const DEMO_MENU_FOR: Duration = Duration::from_millis(4500);
 /// A `lid_open` within this long of the previous one is a repeat (the
 /// case re-advertises its lid state) and never shows the card again.
 const LID_DEDUPE: Duration = Duration::from_secs(10);
@@ -77,6 +84,10 @@ struct Opts {
     socket: PathBuf,
     font: Option<String>,
     margin: i32,
+    menu: bool,
+    anchor: Option<f32>,
+    /// `--dump --menu`: draw this item hovered (`mode:N`, `ca`, `row:N`).
+    hover: Option<String>,
 }
 
 fn usage() {
@@ -91,6 +102,9 @@ USAGE
 OPTIONS
     --socket PATH     daemon socket [default: $XDG_RUNTIME_DIR/librepods.sock]
     --demo            sample card; Connect simulates a connection
+    --menu            with --demo/--dump: the bar dropdown instead of the card
+    --anchor X        with --demo --menu: icon position (logical px)
+    --hover ITEM      with --dump --menu: draw mode:N, ca or row:N hovered
     --model M         sample device for --demo/--dump:
                       pro (default), pro1, pro3, 4, 3, 2, max, or 0xID
     --button STATE    sample button: connect, connecting, connected, failed
@@ -117,6 +131,9 @@ fn parse_args() -> Result<Option<Opts>, String> {
         socket: ipc::default_socket(),
         font: None,
         margin: 0,
+        menu: false,
+        anchor: None,
+        hover: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -133,6 +150,15 @@ fn parse_args() -> Result<Option<Opts>, String> {
             "-v" | "--verbose" => VERBOSE.store(true, Ordering::Relaxed),
             "--demo" => o.demo = true,
             "--backdrop" => o.backdrop = true,
+            "--menu" => o.menu = true,
+            "--hover" => o.hover = Some(val("--hover")?),
+            "--anchor" => {
+                o.anchor = Some(
+                    val("--anchor")?
+                        .parse::<f32>()
+                        .map_err(|_| "--anchor needs a number (logical px)")?,
+                )
+            }
             "--model" => o.model = Some(val("--model")?),
             "--socket" => o.socket = PathBuf::from(val("--socket")?),
             "--font" => o.font = Some(val("--font")?),
@@ -211,9 +237,19 @@ fn main() -> ExitCode {
             Some(ButtonKind::Failed) => app.link = Link::Failed,
             _ => {}
         }
-        app.show(Why::Demo, now);
-        if app.card.is_none() {
-            return ExitCode::FAILURE;
+        if app.opts.menu {
+            // The dropdown shows its connected state unless asked otherwise.
+            app.dev.connected = !matches!(app.opts.button, Some(ButtonKind::Connect));
+            app.dev.allow_off = Some(true);
+            app.toggle_menu(app.opts.anchor, now);
+            if app.menu.is_none() {
+                return ExitCode::FAILURE;
+            }
+        } else {
+            app.show(Why::Demo, now);
+            if app.card.is_none() {
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         vlog!("socket: {}", app.opts.socket.display());
@@ -252,6 +288,8 @@ struct Card {
     next_spin: Option<Instant>,
     /// Both buffers busy on the last attempt; wait for a release.
     starved: bool,
+    /// The last frame was mid-animation: draw one more at the end state.
+    was_animating: bool,
 }
 
 impl Card {
@@ -260,11 +298,27 @@ impl Card {
     }
 }
 
+struct MenuState {
+    /// 0 hidden … 1 at rest.
+    vis: Tween,
+    leaving: bool,
+    /// Panel's left edge on the output.
+    panel_x: f32,
+    hover: MenuHit,
+    pressed: Option<MenuHit>,
+    starved: bool,
+    opened: Instant,
+    was_animating: bool,
+}
+
 struct App {
     opts: Opts,
     dev: Device,
     link: Link,
     card: Option<Card>,
+    menu: Option<MenuState>,
+    menu_dirty: bool,
+    menu_renderer: MenuRenderer,
     wl: Option<Wl>,
     renderer: Renderer,
     watch: Option<Watch>,
@@ -294,6 +348,9 @@ impl App {
             dev: Device::default(),
             link: Link::Idle,
             card: None,
+            menu: None,
+            menu_dirty: false,
+            menu_renderer: MenuRenderer::default(),
             wl: None,
             renderer: Renderer::default(),
             watch: None,
@@ -353,23 +410,17 @@ impl App {
         }
 
         if !self.headless {
-            if self.wl.is_none() {
-                match Wl::connect() {
-                    Ok(w) => self.wl = Some(w),
-                    Err(e) => {
-                        eprintln!("librepods-popup: wayland: {e}");
-                        return;
-                    }
-                }
+            if !self.ensure_wayland() {
+                return;
             }
             let wl = self.wl.as_mut().expect("wl");
             let (w, h) = render::surface_size();
-            if let Err(e) = wl.show(w, h, render::card_rect(), self.opts.margin) {
+            if let Err(e) = wl.show_card(w, h, render::card_rect(), self.opts.margin) {
                 eprintln!("librepods-popup: wayland: {e}");
-                self.wl = None;
+                wl.hide_card();
                 return;
             }
-            vlog!("showing ({why:?}), scale {}", wl.scale());
+            vlog!("showing ({why:?}), scale {}", wl.scale(Target::Card));
         }
         if self.dev.connected {
             // Seen on screen for this connection: no HUD for it later.
@@ -390,6 +441,7 @@ impl App {
             rings,
             next_spin: None,
             starved: false,
+            was_animating: false,
         });
         self.cursor = Cursor::Default;
         self.dirty = true;
@@ -409,25 +461,246 @@ impl App {
 
     fn destroy_card(&mut self) {
         if let Some(wl) = self.wl.as_mut() {
-            wl.hide();
+            wl.hide_card();
         }
         self.card = None;
         self.renderer.clear();
         if self.link == Link::Failed {
             self.link = Link::Idle;
         }
-        if self.opts.demo {
+        if self.opts.demo && self.menu.is_none() {
             self.exit = true;
         }
+    }
+
+    /// Connect to Wayland on first use.
+    fn ensure_wayland(&mut self) -> bool {
+        if self.wl.is_none() {
+            match Wl::connect() {
+                Ok(w) => self.wl = Some(w),
+                Err(e) => {
+                    eprintln!("librepods-popup: wayland: {e}");
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn wayland_lost(&mut self, e: &str) {
         eprintln!("librepods-popup: wayland: {e}");
         self.wl = None;
         self.card = None;
+        self.menu = None;
         self.renderer.clear();
+        self.menu_renderer = MenuRenderer::default();
         if self.opts.demo {
             self.exit = true;
+        }
+    }
+
+    // ── the bar dropdown ──
+
+    /// `menu` event: open under the icon at `anchor_x`, or close if open.
+    fn toggle_menu(&mut self, anchor_x: Option<f32>, now: Instant) {
+        match self.menu.as_ref() {
+            Some(m) if !m.leaving => {
+                self.close_menu(now);
+                return;
+            }
+            Some(_) => self.destroy_menu(),
+            None => {}
+        }
+        if self.headless {
+            self.menu = Some(MenuState {
+                vis: Tween::new(0.0, 1.0, now, MENU_FADE, ease_out_cubic),
+                leaving: false,
+                panel_x: menu::panel_x(anchor_x, 1920.0),
+                hover: MenuHit::Outside,
+                pressed: None,
+                starved: false,
+                opened: now,
+                was_animating: false,
+            });
+            return;
+        }
+        if !self.ensure_wayland() {
+            return;
+        }
+        let wl = self.wl.as_mut().expect("wl");
+        let ((w, _h), out_x) = match wl.open_menu() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("librepods-popup: menu: {e}");
+                wl.close_menu();
+                return;
+            }
+        };
+        let anchor = menu::local_anchor(anchor_x, out_x, w as f32);
+        let x = menu::panel_x(anchor, w as f32);
+        if let Err(e) = wl.place_panel(menu::canvas_pos(x), menu::canvas_size(), menu::canvas_input()) {
+            eprintln!("librepods-popup: menu: {e}");
+            wl.close_menu();
+            return;
+        }
+        vlog!("menu open at x={x} (anchor {anchor_x:?}, output {w} px at {out_x})");
+        self.menu = Some(MenuState {
+            vis: Tween::new(0.0, 1.0, now, MENU_FADE, ease_out_cubic),
+            leaving: false,
+            panel_x: x,
+            hover: MenuHit::Outside,
+            pressed: None,
+            starved: false,
+            opened: now,
+            was_animating: false,
+        });
+        self.cursor = Cursor::Default;
+        self.menu_dirty = true;
+    }
+
+    fn close_menu(&mut self, now: Instant) {
+        if let Some(m) = self.menu.as_mut()
+            && !m.leaving
+        {
+            vlog!("menu close");
+            m.leaving = true;
+            m.pressed = None;
+            m.vis.retarget(0.0, now, MENU_FADE, ease_in_cubic);
+            self.menu_dirty = true;
+            // Clicks and keys go through again while it fades.
+            if let Some(wl) = self.wl.as_mut() {
+                wl.release_menu_input();
+            }
+        }
+    }
+
+    fn destroy_menu(&mut self) {
+        if let Some(wl) = self.wl.as_mut() {
+            wl.close_menu();
+        }
+        self.menu = None;
+        self.menu_renderer = MenuRenderer::default();
+        if self.opts.demo && self.card.is_none() {
+            self.exit = true;
+        }
+    }
+
+    fn menu_view(&self) -> MenuView {
+        let (hover, pressed) = self.menu.as_ref().map_or((MenuHit::Outside, None), |m| (m.hover, m.pressed));
+        MenuView::new(&self.dev, hover, pressed)
+    }
+
+    fn on_menu_input(&mut self, ev: Input, now: Instant) {
+        let Some(m) = self.menu.as_ref() else { return };
+        if m.leaving {
+            return;
+        }
+        let (px, before) = (m.panel_x, (m.hover, m.pressed));
+        let view = self.menu_view();
+        let hit = |x: f64, y: f64| menu::hit(&view, x as f32 - px, y as f32 - menu::PANEL_TOP);
+        let m = self.menu.as_mut().expect("menu");
+        let mut activate = None;
+        let mut close = false;
+        match ev {
+            Input::Enter(_, x, y) => {
+                m.hover = hit(x, y);
+                self.cursor = Cursor::Default;
+            }
+            Input::Motion(_, x, y) | Input::TouchMotion(_, x, y) => m.hover = hit(x, y),
+            Input::Leave(_) => {
+                m.hover = MenuHit::Outside;
+                m.pressed = None;
+            }
+            Input::Press(_, b) if b == BTN_LEFT || b == BTN_RIGHT => {
+                if m.hover == MenuHit::Outside {
+                    // A click anywhere else closes the menu (and is eaten,
+                    // like a real menu).
+                    close = true;
+                } else if b == BTN_LEFT {
+                    m.pressed = Some(m.hover);
+                }
+            }
+            Input::Release(_, BTN_LEFT) => {
+                if m.pressed.take() == Some(m.hover) && m.hover.clickable() {
+                    activate = Some(m.hover);
+                }
+            }
+            Input::TouchDown(_, x, y) => {
+                m.hover = hit(x, y);
+                if m.hover == MenuHit::Outside {
+                    close = true;
+                } else {
+                    m.pressed = Some(m.hover);
+                }
+            }
+            Input::TouchUp(_) => {
+                let h = std::mem::replace(&mut m.hover, MenuHit::Outside);
+                if m.pressed.take() == Some(h) && h.clickable() {
+                    activate = Some(h);
+                }
+            }
+            _ => {}
+        }
+        let want = if m.hover.clickable() { Cursor::Pointer } else { Cursor::Default };
+        if (m.hover, m.pressed) != before {
+            self.menu_dirty = true;
+        }
+        if want != self.cursor
+            && let Some(wl) = self.wl.as_ref()
+        {
+            wl.set_cursor(want);
+            self.cursor = want;
+        }
+        if close {
+            self.close_menu(now);
+        } else if let Some(h) = activate {
+            self.activate_menu(h, now);
+        }
+    }
+
+    fn command(&mut self, line: &str) {
+        if self.opts.demo {
+            eprintln!("librepods-popup: (demo) would send `{line}`");
+            return;
+        }
+        match ipc::send(&self.opts.socket, CmdKind::Other, line, OPEN_TIMEOUT) {
+            Ok(c) => self.cmds.push(c),
+            Err(e) => vlog!("{line}: {e}"),
+        }
+    }
+
+    fn activate_menu(&mut self, h: MenuHit, now: Instant) {
+        vlog!("menu: {h:?}");
+        match h {
+            MenuHit::Mode(m) => {
+                self.command(&format!("mode {}", m.wire()));
+                // Optimistic; the next status line confirms or corrects.
+                self.dev.listening_mode = Some(m.wire().into());
+                self.menu_dirty = true;
+            }
+            MenuHit::Ca => {
+                let on = self.dev.conversational_awareness != Some(true);
+                self.command(if on { "ca on" } else { "ca off" });
+                self.dev.conversational_awareness = Some(on);
+                self.menu_dirty = true;
+            }
+            MenuHit::Row(Row::Link) => {
+                if self.dev.connected {
+                    self.command("disconnect");
+                } else {
+                    self.start_connect(now);
+                }
+                self.close_menu(now);
+            }
+            MenuHit::Row(Row::Bluetooth) => {
+                spawn_detached(&["alacritty", "--class", "floatterm", "-e", "bluetui"]);
+                self.close_menu(now);
+            }
+            MenuHit::Row(Row::Settings) => {
+                self.open_app();
+                self.close_menu(now);
+            }
+            MenuHit::Outside | MenuHit::Inert => {}
         }
     }
 
@@ -484,6 +757,10 @@ impl App {
             }
             Event::LidClose => self.hide(now),
             Event::Popup => self.show(Why::Popup, now),
+            Event::Menu => {
+                let anchor = obj.get("anchor_x").and_then(serde_json::Value::as_f64).map(|a| a as f32);
+                self.toggle_menu(anchor, now);
+            }
             Event::Connecting => {
                 if !self.dev.connected && !self.connecting() {
                     self.link = Link::Connecting {
@@ -512,6 +789,7 @@ impl App {
         }
         self.sync_rings(now);
         self.dirty = true;
+        self.menu_dirty = true;
     }
 
     /// The AirPods connected to this machine. A `connected` *event* (not
@@ -598,44 +876,44 @@ impl App {
         let mut activate = None;
         let hit = |x: f64, y: f64| render::hit(x as f32, y as f32);
         match ev {
-            Input::Enter(x, y) => {
+            Input::Enter(_, x, y) => {
                 card.hovered = true;
                 card.hover = hit(x, y);
                 card.last_touch = now;
                 // The compositor-side cursor was just reset to the arrow.
                 self.cursor = Cursor::Default;
             }
-            Input::Motion(x, y) => {
+            Input::Motion(_, x, y) => {
                 card.hovered = true;
                 card.hover = hit(x, y);
                 card.last_touch = now;
             }
-            Input::Leave => {
+            Input::Leave(_) => {
                 card.hovered = false;
                 card.hover = Hit::Outside;
                 card.pressed = None;
                 card.last_touch = now;
             }
-            Input::Press(BTN_LEFT) => {
+            Input::Press(_, BTN_LEFT) => {
                 card.pressed = Some(card.hover);
                 card.last_touch = now;
             }
-            Input::Press(BTN_RIGHT) => {
+            Input::Press(_, BTN_RIGHT) => {
                 // Right-click anywhere dismisses, like a notification.
                 activate = Some(Hit::Close);
             }
-            Input::Release(BTN_LEFT) => {
+            Input::Release(_, BTN_LEFT) => {
                 if card.pressed.take() == Some(card.hover) {
                     activate = Some(card.hover);
                 }
             }
-            Input::TouchDown(x, y) => {
+            Input::TouchDown(_, x, y) => {
                 card.hover = hit(x, y);
                 card.pressed = Some(card.hover);
                 card.last_touch = now;
             }
-            Input::TouchMotion(x, y) => card.hover = hit(x, y),
-            Input::TouchUp => {
+            Input::TouchMotion(_, x, y) => card.hover = hit(x, y),
+            Input::TouchUp(_) => {
                 let h = std::mem::replace(&mut card.hover, Hit::Outside);
                 if card.pressed.take() == Some(h) {
                     activate = Some(h);
@@ -646,7 +924,7 @@ impl App {
                 card.pressed = None;
                 card.hover = Hit::Outside;
             }
-            Input::Press(_) | Input::Release(_) => {}
+            Input::Press(..) | Input::Release(..) | Input::Key(_) => {}
         }
 
         let hover = card.hover;
@@ -694,7 +972,7 @@ impl App {
         if self.opts.demo {
             self.demo_connect_at = Some(now + Duration::from_millis(1800));
         } else {
-            match ipc::send(&self.opts.socket, CmdKind::Connect, CONNECT_TIMEOUT) {
+            match ipc::send(&self.opts.socket, CmdKind::Connect, "connect", CONNECT_TIMEOUT) {
                 Ok(c) => self.cmds.push(c),
                 Err(e) => {
                     vlog!("connect: {e}");
@@ -711,7 +989,7 @@ impl App {
             eprintln!("librepods-popup: (demo) would open the LibrePods window");
             return;
         }
-        match ipc::send(&self.opts.socket, CmdKind::Open, OPEN_TIMEOUT) {
+        match ipc::send(&self.opts.socket, CmdKind::Open, "open", OPEN_TIMEOUT) {
             Ok(c) => self.cmds.push(c),
             Err(e) => vlog!("open: {e}"),
         }
@@ -740,6 +1018,14 @@ impl App {
             self.link = if self.card_up() { Link::Failed } else { Link::Idle };
             self.touch(now);
             self.dirty = true;
+        }
+
+        if let Some(m) = self.menu.as_ref() {
+            if m.leaving && m.vis.done(now) {
+                self.destroy_menu();
+            } else if !m.leaving && self.opts.demo && now >= m.opened + DEMO_MENU_FOR {
+                self.close_menu(now);
+            }
         }
 
         let connecting = self.connecting();
@@ -777,11 +1063,28 @@ impl App {
             }
             at(c.next_spin);
             if let Some(wl) = &self.wl {
-                if let Some(since) = wl.frame_pending() {
+                if let Some(since) = wl.frame_pending(Target::Card) {
                     at(Some(since + FRAME_FALLBACK));
                 } else if c.starved {
                     at(Some(now + FRAME_FALLBACK));
-                } else if self.dirty || c.animating(now) {
+                } else if self.dirty || c.animating(now) || c.was_animating {
+                    at(Some(now));
+                }
+            }
+        }
+        if let Some(m) = &self.menu {
+            if m.leaving && m.vis.done(now) {
+                at(Some(now));
+            }
+            if !m.leaving && self.opts.demo {
+                at(Some(m.opened + DEMO_MENU_FOR));
+            }
+            if let Some(wl) = &self.wl {
+                if let Some(since) = wl.frame_pending(Target::Menu) {
+                    at(Some(since + FRAME_FALLBACK));
+                } else if m.starved {
+                    at(Some(now + FRAME_FALLBACK));
+                } else if self.menu_dirty || !m.vis.done(now) || m.was_animating {
                     at(Some(now));
                 }
             }
@@ -843,23 +1146,23 @@ impl App {
             return;
         }
         let Some(wl) = self.wl.as_mut() else { return };
-        if wl.st.frame_done {
-            wl.clear_frame_pending();
+        if wl.st.card.frame_done {
+            wl.clear_frame_pending(Target::Card);
         }
-        if wl.st.scale_changed {
-            wl.st.scale_changed = false;
+        if wl.st.card.scale_changed {
+            wl.st.card.scale_changed = false;
             self.dirty = true;
         }
-        if let Some(since) = wl.frame_pending() {
+        if let Some(since) = wl.frame_pending(Target::Card) {
             if now.duration_since(since) < FRAME_FALLBACK {
                 return;
             }
-            wl.clear_frame_pending();
+            wl.clear_frame_pending(Target::Card);
         }
         let card = self.card.as_ref().expect("card");
         let animating = card.animating(now);
         let spin_due = card.next_spin.is_some_and(|t| now >= t);
-        if !(self.dirty || animating || spin_due) {
+        if !(self.dirty || animating || spin_due || card.was_animating) {
             return;
         }
 
@@ -867,7 +1170,7 @@ impl App {
         let pose = Pose::at(card.vis.value(now));
         let wl = self.wl.as_mut().expect("wl");
         let renderer = &mut self.renderer;
-        let res = wl.draw(animating, |buf, w, h, fmt, scale| {
+        let res = wl.draw(Target::Card, animating, |buf, w, h, fmt, scale| {
             renderer.render(buf, w, h, fmt, scale, &view, pose);
         });
         match res {
@@ -883,8 +1186,51 @@ impl App {
                 let c = self.card.as_mut().expect("card");
                 c.next_spin = next_spin;
                 c.starved = false;
+                c.was_animating = animating;
             }
             Ok(false) => self.card.as_mut().expect("card").starved = true,
+            Err(e) => self.wayland_lost(&e),
+        }
+    }
+
+    fn redraw_menu(&mut self, now: Instant) {
+        if self.menu.is_none() || self.headless {
+            return;
+        }
+        let Some(wl) = self.wl.as_mut() else { return };
+        if wl.st.menu.frame_done {
+            wl.clear_frame_pending(Target::Menu);
+        }
+        if wl.st.menu.scale_changed {
+            wl.st.menu.scale_changed = false;
+            self.menu_dirty = true;
+        }
+        if let Some(since) = wl.frame_pending(Target::Menu) {
+            if now.duration_since(since) < FRAME_FALLBACK {
+                return;
+            }
+            wl.clear_frame_pending(Target::Menu);
+        }
+        let m = self.menu.as_ref().expect("menu");
+        let animating = !m.vis.done(now);
+        if !(self.menu_dirty || animating || m.was_animating) {
+            return;
+        }
+        let view = self.menu_view();
+        let vis = m.vis.value(now);
+        let wl = self.wl.as_mut().expect("wl");
+        let renderer = &mut self.menu_renderer;
+        let res = wl.draw(Target::Menu, animating, |buf, w, h, fmt, scale| {
+            renderer.render(buf, w, h, fmt, scale, &view, vis);
+        });
+        match res {
+            Ok(true) => {
+                self.menu_dirty = false;
+                let m = self.menu.as_mut().expect("menu");
+                m.starved = false;
+                m.was_animating = animating;
+            }
+            Ok(false) => self.menu.as_mut().expect("menu").starved = true,
             Err(e) => self.wayland_lost(&e),
         }
     }
@@ -892,11 +1238,15 @@ impl App {
     fn process_wayland(&mut self, now: Instant) {
         let Some(wl) = self.wl.as_mut() else { return };
         let inputs: Vec<Input> = wl.st.input.drain(..).collect();
-        if wl.st.closed {
-            wl.st.closed = false;
-            vlog!("compositor closed the surface");
+        let card_closed = std::mem::take(&mut wl.st.card.closed);
+        let menu_closed = std::mem::take(&mut wl.st.menu.closed);
+        if card_closed {
+            vlog!("compositor closed the card");
             self.destroy_card();
-            return;
+        }
+        if menu_closed {
+            vlog!("compositor closed the menu");
+            self.destroy_menu();
         }
         if let Some(c) = self.card.as_mut()
             && c.starved
@@ -905,8 +1255,38 @@ impl App {
             c.starved = false;
             self.dirty = true;
         }
+        if let Some(m) = self.menu.as_mut()
+            && m.starved
+        {
+            m.starved = false;
+            self.menu_dirty = true;
+        }
         for i in inputs {
-            self.on_input(i, now);
+            match i {
+                Input::Key(KEY_ESC) => self.close_menu(now),
+                Input::Key(_) => {}
+                Input::TouchCancel => {
+                    if let Some(c) = self.card.as_mut() {
+                        c.pressed = None;
+                        c.hover = Hit::Outside;
+                    }
+                    if let Some(m) = self.menu.as_mut() {
+                        m.pressed = None;
+                        m.hover = MenuHit::Outside;
+                    }
+                }
+                Input::Enter(t, ..)
+                | Input::Motion(t, ..)
+                | Input::Leave(t)
+                | Input::Press(t, _)
+                | Input::Release(t, _)
+                | Input::TouchDown(t, ..)
+                | Input::TouchMotion(t, ..)
+                | Input::TouchUp(t) => match t {
+                    Target::Card => self.on_input(i, now),
+                    Target::Menu => self.on_menu_input(i, now),
+                },
+            }
         }
     }
 
@@ -918,6 +1298,7 @@ impl App {
             self.process_wayland(now);
             self.tick(now);
             self.redraw(now);
+            self.redraw_menu(now);
             if self.exit {
                 return ExitCode::SUCCESS;
             }
@@ -1011,8 +1392,49 @@ fn single_instance() -> Option<std::fs::File> {
     ok.then_some(file)
 }
 
+/// Start a program outside our process group and session, without a
+/// zombie: `setsid -f` forks it and returns at once.
+fn spawn_detached(argv: &[&str]) {
+    use std::process::{Command, Stdio};
+    let r = Command::new("setsid")
+        .arg("-f")
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut c| c.wait());
+    if let Err(e) = r {
+        eprintln!("librepods-popup: {}: {e}", argv[0]);
+    }
+}
+
+/// `--dump --menu`: the dropdown canvas to a PNG.
+fn dump_menu(opts: &Opts, path: &std::path::Path) -> ExitCode {
+    let mut dev = protocol::demo_device(opts.model.as_deref());
+    dev.connected = !matches!(opts.button, Some(ButtonKind::Connect));
+    dev.allow_off = Some(true);
+    let probe = MenuView::new(&dev, MenuHit::Outside, None);
+    let hover = match opts.hover.as_deref().unwrap_or("").split_once(':') {
+        Some(("mode", n)) => n.parse::<usize>().ok().and_then(|i| probe.modes.get(i)).map(|m| MenuHit::Mode(*m)),
+        Some(("row", n)) => n.parse::<usize>().ok().and_then(|i| menu::ROWS.get(i)).map(|r| MenuHit::Row(*r)),
+        _ if opts.hover.as_deref() == Some("ca") => Some(MenuHit::Ca),
+        _ => None,
+    }
+    .unwrap_or(MenuHit::Outside);
+    let view = MenuView::new(&dev, hover, None);
+    let (w, h) = menu::canvas_size();
+    let (pw, ph) = ((w as f32 * opts.scale).round() as u32, (h as f32 * opts.scale).round() as u32);
+    let mut buf = vec![0u8; (pw * ph * 4) as usize];
+    MenuRenderer::default().render(&mut buf, pw, ph, render::Format::Rgba, pw as f32 / w as f32, &view, 1.0);
+    save_png(opts, buf, pw, ph, path)
+}
+
 /// `--dump`: one still frame, rings full, to a PNG.
 fn dump(opts: &Opts, path: &std::path::Path) -> ExitCode {
+    if opts.menu {
+        return dump_menu(opts, path);
+    }
     let dev = protocol::demo_device(opts.model.as_deref());
     let rings = protocol::rings(&dev)
         .into_iter()
@@ -1052,6 +1474,10 @@ fn dump(opts: &Opts, path: &std::path::Path) -> ExitCode {
         &view,
         Pose::REST,
     );
+    save_png(opts, buf, pw, ph, path)
+}
+
+fn save_png(opts: &Opts, buf: Vec<u8>, pw: u32, ph: u32, path: &std::path::Path) -> ExitCode {
     let Some(card) = tiny_skia::IntSize::from_wh(pw, ph).and_then(|s| tiny_skia::Pixmap::from_vec(buf, s)) else {
         eprintln!("librepods-popup: bad dump size");
         return ExitCode::FAILURE;
@@ -1107,6 +1533,9 @@ mod tests {
             socket: PathBuf::from("/nonexistent"),
             font: None,
             margin: 0,
+            menu: false,
+            anchor: None,
+            hover: None,
         });
         a.headless = true;
         a
@@ -1189,6 +1618,48 @@ mod tests {
         a.on_line(&line("disconnected", false, false), t3 + S);
         a.on_line(&line("connected", true, false), t3 + 2 * S);
         assert!(a.card_up());
+    }
+
+    #[test]
+    fn menu_toggles_and_coexists_with_the_card() {
+        let mut a = app();
+        let t = Instant::now();
+        a.on_line(&line("lid_open", false, true), t);
+        a.on_line(r#"{"event":"menu","anchor_x":1700}"#, t + S);
+        assert!(a.card_up(), "the card stays");
+        let m = a.menu.as_ref().expect("menu opens");
+        assert_eq!(m.panel_x, 1700.0 - menu::PANEL_W / 2.0);
+        // Second `menu` event: close (fade), then gone.
+        a.on_line(r#"{"event":"menu","anchor_x":1700}"#, t + 2 * S);
+        assert!(a.menu.as_ref().unwrap().leaving);
+        a.tick(t + 2 * S + MENU_FADE + Duration::from_millis(5));
+        assert!(a.menu.is_none());
+        assert!(a.card.is_some());
+        // No anchor: right edge.
+        a.on_line(r#"{"event":"menu","anchor_x":null}"#, t + 3 * S);
+        assert_eq!(a.menu.as_ref().unwrap().panel_x, 1920.0 - menu::EDGE - menu::PANEL_W);
+    }
+
+    #[test]
+    fn menu_actions() {
+        let mut a = app();
+        let t = Instant::now();
+        a.on_line(&line("status", true, false), t);
+        a.on_line(r#"{"event":"menu","anchor_x":900}"#, t);
+        assert!(a.card.is_none(), "the menu never brings up the card");
+        // Mode and CA: optimistic, menu stays open.
+        a.activate_menu(MenuHit::Mode(protocol::Mode::Transparency), t);
+        assert_eq!(a.dev.mode(), Some(protocol::Mode::Transparency));
+        let ca = a.dev.conversational_awareness == Some(true);
+        a.activate_menu(MenuHit::Ca, t);
+        assert_eq!(a.dev.conversational_awareness, Some(!ca));
+        assert!(!a.menu.as_ref().unwrap().leaving);
+        // The next status line is the truth.
+        a.on_line(r#"{"event":"status","listening_mode":"anc"}"#, t + S);
+        assert_eq!(a.dev.mode(), Some(protocol::Mode::Anc));
+        // A menu row closes it.
+        a.activate_menu(MenuHit::Row(Row::Settings), t + S);
+        assert!(a.menu.as_ref().unwrap().leaving);
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub struct Status {
     /// Seen in a BLE advertisement recently.
     pub nearby: bool,
     /// Their BLE advert says they are connected to some other host.
+    #[serde(rename = "connected_elsewhere")]
     pub other_host: bool,
     pub name: Option<String>,
     pub model: Option<String>,

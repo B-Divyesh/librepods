@@ -163,7 +163,22 @@ impl AirPodsDevice {
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
         hub().set_command_tx(Some(command_tx.clone()));
 
-        aacp_manager.set_event_channel(tx).await;
+        aacp_manager.set_event_channel(tx.clone()).await;
+        // The buds report battery and ear state right after the handshake,
+        // before this channel existed; replay what the manager already has
+        // (upstream dropped these, leaving battery unknown for minutes).
+        {
+            let st = aacp_manager.state.lock().await;
+            if !st.battery_info.is_empty() {
+                let _ = tx.send(AACPEvent::BatteryInfo(st.battery_info.clone()));
+            }
+            if !st.ear_detection_status.is_empty() {
+                let _ = tx.send(AACPEvent::EarDetection(
+                    st.old_ear_detection_status.clone(),
+                    st.ear_detection_status.clone(),
+                ));
+            }
+        }
         if let Some(handle) = &tray_handle {
             handle
                 .update(|tray: &mut MyTray| tray.command_tx = Some(command_tx.clone()))

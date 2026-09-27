@@ -538,7 +538,17 @@ fn spawn_popup() {
         use std::sync::atomic::Ordering::Relaxed;
         let mut backoff = std::time::Duration::from_secs(5);
         loop {
-            match tokio::process::Command::new(&path).kill_on_drop(true).spawn() {
+            let mut cmd = tokio::process::Command::new(&path);
+            cmd.kill_on_drop(true);
+            // Die with us, even on SIGKILL — an orphaned copy would hold the
+            // popup's single-instance lock and run a stale build.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                });
+            }
+            match cmd.spawn() {
                 Ok(mut child) => {
                     let started = std::time::Instant::now();
                     notify::POPUP_RUNNING.store(true, Relaxed);

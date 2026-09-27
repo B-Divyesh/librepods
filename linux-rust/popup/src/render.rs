@@ -13,13 +13,14 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use tiny_skia::{
-    Color, Mask, Path, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Transform,
+    Color, Path, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Transform,
 };
 
 use crate::art::{self, Led};
 use crate::draw::*;
 use crate::protocol::{Batt, Product, RingId};
 use crate::text::{self, Align, Style, Weight};
+use crate::theme::*;
 
 pub const CARD_W: f32 = 360.0;
 pub const CARD_H: f32 = 356.0;
@@ -163,59 +164,6 @@ impl Pose {
 
 // ─────────────────────────────── palette ────────────────────────────────
 
-// The user's "Ember" desktop theme, shared with Waybar, mako and the
-// LibrePods window.
-
-/// #1a141b — card background and text on amber.
-fn ember_dark() -> Color {
-    rgb(0x1a, 0x14, 0x1b)
-}
-/// #f0e4d4
-fn text_primary() -> Color {
-    rgb(0xf0, 0xe4, 0xd4)
-}
-/// #bfa998
-fn text_secondary() -> Color {
-    rgb(0xbf, 0xa9, 0x98)
-}
-/// #7d6a66
-fn text_tertiary() -> Color {
-    rgb(0x7d, 0x6a, 0x66)
-}
-/// rgba(240,228,212,a) — neutral fills and ring tracks.
-fn cream(a: f32) -> Color {
-    rgba(0xf0, 0xe4, 0xd4, a)
-}
-/// #e89b5e — accent.
-fn amber() -> Color {
-    rgb(0xe8, 0x9b, 0x5e)
-}
-/// #a8c686
-fn green() -> Color {
-    rgb(0xa8, 0xc6, 0x86)
-}
-/// #efcf9f
-fn gold() -> Color {
-    rgb(0xef, 0xcf, 0x9f)
-}
-/// #e5534b
-fn red() -> Color {
-    rgb(0xe5, 0x53, 0x4b)
-}
-/// #8cb3d9
-fn blue() -> Color {
-    rgb(0x8c, 0xb3, 0xd9)
-}
-
-/// Same thresholds as the Waybar battery module.
-fn ring_color(level: Option<u8>) -> Color {
-    match level {
-        Some(l) if l <= 10 => red(),
-        Some(l) if l <= 20 => gold(),
-        _ => green(),
-    }
-}
-
 // ─────────────────────────────── renderer ───────────────────────────────
 
 #[derive(Default)]
@@ -324,10 +272,10 @@ impl Renderer {
     }
 }
 
-struct Layer<'a> {
-    data: &'a [u8],
-    w: usize,
-    h: usize,
+pub(crate) struct Layer<'a> {
+    pub data: &'a [u8],
+    pub w: usize,
+    pub h: usize,
 }
 
 #[inline]
@@ -337,7 +285,7 @@ fn div255(x: u32) -> u32 {
 
 /// `out` = `src` moved down by `dy` rows at opacity `alpha`/256
 /// (premultiplied, so opacity is a plain scale), optionally writing BGRA.
-fn copy_frame(out: &mut [u8], src: &[u8], w: usize, h: usize, dy: i32, alpha: u32, swap: bool) {
+pub(crate) fn copy_frame(out: &mut [u8], src: &[u8], w: usize, h: usize, dy: i32, alpha: u32, swap: bool) {
     let stride = w * 4;
     for y in 0..h {
         let row = &mut out[y * stride..(y + 1) * stride];
@@ -372,7 +320,7 @@ fn copy_frame(out: &mut [u8], src: &[u8], w: usize, h: usize, dy: i32, alpha: u3
 /// Premultiplied source-over of `src` at (ox, oy), scaled by
 /// `alpha`/256, clipped to the destination. `SWAP` writes BGRA.
 #[allow(clippy::too_many_arguments)]
-fn blend_over<const SWAP: bool>(dst: &mut [u8], dw: usize, dh: usize, src: &Layer, ox: i32, oy: i32, alpha: u32) {
+pub(crate) fn blend_over<const SWAP: bool>(dst: &mut [u8], dw: usize, dh: usize, src: &Layer, ox: i32, oy: i32, alpha: u32) {
     let x0 = ox.max(0) as usize;
     let x1 = ((ox + src.w as i32).min(dw as i32)).max(0) as usize;
     if x1 <= x0 {
@@ -415,77 +363,20 @@ fn card_path() -> Path {
     rrect(0.0, 0.0, CARD_W, CARD_H, RADIUS)
 }
 
-/// Soft two-layer drop shadow as surface-sized coverage, with the card's
-/// own footprint cut out so the translucent card isn't darkened from
-/// behind. Blurred at 1× (it is all low frequency) and scaled up.
+/// The card's drop shadow as surface-sized coverage, with the card's own
+/// footprint cut out so the translucent card isn't darkened from behind.
 fn make_shadow(w: u32, h: u32, scale: f32) -> Vec<u8> {
     let (lw, lh) = surface_size();
-    let (lwu, lhu) = (lw as usize, lh as usize);
-    let at1 = Transform::from_translate(PAD, PAD);
-
-    let layer = |dy: f32, sigma: f32, alpha: f32| -> Vec<f32> {
-        let mut m = Mask::new(lw, lh).expect("mask");
-        m.fill_path(
-            &card_path(),
-            tiny_skia::FillRule::Winding,
-            true,
-            Transform::from_translate(0.0, dy).pre_concat(at1),
-        );
-        let mut buf: Vec<f32> = m.data().iter().map(|&a| a as f32 / 255.0).collect();
-        blur_alpha(&mut buf, lwu, lhu, sigma);
-        buf.iter_mut().for_each(|a| *a *= alpha);
-        buf
-    };
-    // Kept below Hyprland's `ignore_alpha 0.3` for this namespace, so the
-    // compositor blurs behind the card but never behind its shadow.
-    let wide = layer(8.0, 14.0, 0.34);
-    let tight = layer(1.0, 1.2, 0.12);
-
-    const MAX_SHADOW: f32 = 0.27;
-    let cov: Vec<f32> = wide
-        .iter()
-        .zip(&tight)
-        .map(|(a, b)| (1.0 - (1.0 - a) * (1.0 - b)).min(MAX_SHADOW))
-        .collect();
-
     let (ox, oy) = origin_px(scale);
-    let mut cut = Mask::new(w, h).expect("mask");
-    cut.fill_path(
+    let shape = card_path().transform(Transform::from_translate(PAD, PAD)).expect("path");
+    soft_shadow(
+        (lw, lh),
+        &shape,
+        &[(8.0, 14.0, 0.34), (1.0, 1.2, 0.12)],
+        (w, h),
         &card_path(),
-        tiny_skia::FillRule::Winding,
-        true,
         Transform::from_translate(ox as f32, oy as f32).pre_scale(scale, scale),
-    );
-
-    // Bilinear upscale of the 1× coverage to buffer pixels: column taps
-    // precomputed, rows blended once, then one lerp per pixel.
-    let (fx, fy) = (lw as f32 / w as f32, lh as f32 / h as f32);
-    let taps: Vec<(usize, usize, f32)> = (0..w as usize)
-        .map(|x| {
-            let sx = ((x as f32 + 0.5) * fx - 0.5).clamp(0.0, (lwu - 1) as f32);
-            let x0 = sx.floor() as usize;
-            (x0, (x0 + 1).min(lwu - 1), sx - x0 as f32)
-        })
-        .collect();
-    let mut row = vec![0.0f32; lwu];
-    let mut out = vec![0u8; w as usize * h as usize];
-    let cutd = cut.data();
-    for y in 0..h as usize {
-        let sy = ((y as f32 + 0.5) * fy - 0.5).clamp(0.0, (lhu - 1) as f32);
-        let y0 = sy.floor() as usize;
-        let (y1, ty) = ((y0 + 1).min(lhu - 1), sy - y0 as f32);
-        let (r0, r1) = (&cov[y0 * lwu..(y0 + 1) * lwu], &cov[y1 * lwu..(y1 + 1) * lwu]);
-        for ((d, a), b) in row.iter_mut().zip(r0).zip(r1) {
-            *d = a + (b - a) * ty;
-        }
-        let orow = &mut out[y * w as usize..(y + 1) * w as usize];
-        let crow = &cutd[y * w as usize..(y + 1) * w as usize];
-        for ((o, &(x0, x1, tx)), &c) in orow.iter_mut().zip(&taps).zip(crow) {
-            let a = row[x0] + (row[x1] - row[x0]) * tx;
-            *o = (a * (255 - c) as f32).clamp(0.0, 255.0) as u8;
-        }
-    }
-    out
+    )
 }
 
 /// The illustration, rendered once per product/LED/scale.
@@ -555,7 +446,7 @@ fn ring_x(i: usize, n: usize) -> f32 {
 }
 
 /// Arc as cubic Béziers; angles in degrees, 0 = 3 o'clock, clockwise.
-fn arc(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> Option<Path> {
+pub(crate) fn arc(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> Option<Path> {
     if (a1 - a0).abs() < 0.01 {
         return None;
     }
@@ -598,7 +489,7 @@ fn ring_span(charging: bool) -> (f32, f32) {
     }
 }
 
-fn bolt(cx: f32, cy: f32, h: f32) -> Path {
+pub(crate) fn bolt(cx: f32, cy: f32, h: f32) -> Path {
     let k = h / 12.0;
     let pts = [(0.9, -6.0), (-3.9, 1.1), (-0.5, 1.1), (-1.1, 6.0), (3.9, -1.4), (0.5, -1.4)];
     let mut pb = PathBuilder::new();

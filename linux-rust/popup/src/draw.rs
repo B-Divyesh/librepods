@@ -10,6 +10,72 @@ use tiny_skia::{
     RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
+/// Never darker than this: Hyprland's `ignore_alpha 0.3` rule for our
+/// namespaces then blurs behind the panel/card but not behind the shadow.
+pub const MAX_SHADOW: f32 = 0.27;
+
+/// Soft drop shadow as a coverage map (0–255, black) of `px` pixels for a
+/// canvas that is `logical` px at 1×. `shape` is in logical canvas
+/// coordinates; each layer is (y offset, blur sigma, opacity). Blurred at
+/// 1× (it is all low frequency) and scaled up bilinearly. `cut` drawn with
+/// `cut_ts` is removed, so a translucent body isn't darkened from behind.
+pub fn soft_shadow(
+    logical: (u32, u32),
+    shape: &Path,
+    layers: &[(f32, f32, f32)],
+    px: (u32, u32),
+    cut: &Path,
+    cut_ts: Transform,
+) -> Vec<u8> {
+    let (lw, lh) = logical;
+    let (w, h) = px;
+    let (lwu, lhu) = (lw as usize, lh as usize);
+    let mut cov = vec![0.0f32; lwu * lhu];
+    for &(dy, sigma, alpha) in layers {
+        let mut m = Mask::new(lw, lh).expect("mask");
+        m.fill_path(shape, FillRule::Winding, true, Transform::from_translate(0.0, dy));
+        let mut buf: Vec<f32> = m.data().iter().map(|&a| a as f32 / 255.0).collect();
+        blur_alpha(&mut buf, lwu, lhu, sigma);
+        for (c, b) in cov.iter_mut().zip(&buf) {
+            *c = 1.0 - (1.0 - *c) * (1.0 - b * alpha);
+        }
+    }
+    cov.iter_mut().for_each(|c| *c = c.min(MAX_SHADOW));
+
+    let mut cutm = Mask::new(w, h).expect("mask");
+    cutm.fill_path(cut, FillRule::Winding, true, cut_ts);
+
+    // Bilinear upscale: column taps precomputed, rows blended once, then
+    // one lerp per pixel.
+    let (fx, fy) = (lw as f32 / w as f32, lh as f32 / h as f32);
+    let taps: Vec<(usize, usize, f32)> = (0..w as usize)
+        .map(|x| {
+            let sx = ((x as f32 + 0.5) * fx - 0.5).clamp(0.0, (lwu - 1) as f32);
+            let x0 = sx.floor() as usize;
+            (x0, (x0 + 1).min(lwu - 1), sx - x0 as f32)
+        })
+        .collect();
+    let mut row = vec![0.0f32; lwu];
+    let mut out = vec![0u8; w as usize * h as usize];
+    let cutd = cutm.data();
+    for y in 0..h as usize {
+        let sy = ((y as f32 + 0.5) * fy - 0.5).clamp(0.0, (lhu - 1) as f32);
+        let y0 = sy.floor() as usize;
+        let (y1, ty) = ((y0 + 1).min(lhu - 1), sy - y0 as f32);
+        let (r0, r1) = (&cov[y0 * lwu..(y0 + 1) * lwu], &cov[y1 * lwu..(y1 + 1) * lwu]);
+        for ((d, a), b) in row.iter_mut().zip(r0).zip(r1) {
+            *d = a + (b - a) * ty;
+        }
+        let orow = &mut out[y * w as usize..(y + 1) * w as usize];
+        let crow = &cutd[y * w as usize..(y + 1) * w as usize];
+        for ((o, &(x0, x1, tx)), &c) in orow.iter_mut().zip(&taps).zip(crow) {
+            let a = row[x0] + (row[x1] - row[x0]) * tx;
+            *o = (a * (255 - c) as f32).clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
 pub fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
     Color::from_rgba8(r, g, b, (a.clamp(0.0, 1.0) * 255.0).round() as u8)
 }

@@ -28,6 +28,13 @@ pub struct Device {
     pub headphone: Option<Batt>,
     pub lid_open: Option<bool>,
     pub listening_mode: Option<String>,
+    pub conversational_awareness: Option<bool>,
+    /// The model lets you pick "Off" as a listening mode.
+    pub allow_off: Option<bool>,
+    /// (left, right) in an ear.
+    pub in_ear: Option<(bool, bool)>,
+    /// The daemon says the AirPods are connected to another device.
+    pub elsewhere: Option<bool>,
 }
 
 /// The events the daemon sends. Unknown names are kept verbatim so they
@@ -44,6 +51,8 @@ pub enum Event {
     Mode,
     LowBattery,
     Popup,
+    /// Toggle the bar dropdown; carries `anchor_x`.
+    Menu,
     Other(String),
 }
 
@@ -60,6 +69,7 @@ impl Event {
             "mode" => Event::Mode,
             "low_battery" => Event::LowBattery,
             "popup" => Event::Popup,
+            "menu" => Event::Menu,
             other => Event::Other(other.to_string()),
         }
     }
@@ -94,6 +104,15 @@ impl Device {
                 "headphone" => self.headphone = batt(v),
                 "lid_open" => self.lid_open = v.as_bool(),
                 "listening_mode" => self.listening_mode = nonempty(v),
+                "conversational_awareness" => self.conversational_awareness = v.as_bool(),
+                "allow_off" => self.allow_off = v.as_bool(),
+                "in_ear" => {
+                    self.in_ear = v.as_object().map(|o| {
+                        let f = |k: &str| o.get(k).and_then(Value::as_bool).unwrap_or(false);
+                        (f("left"), f("right"))
+                    })
+                }
+                "connected_elsewhere" | "elsewhere" | "other_device" => self.elsewhere = v.as_bool(),
                 _ => {}
             }
         }
@@ -110,6 +129,85 @@ impl Device {
 
     pub fn product(&self) -> Product {
         Product::identify(self.model_id, self.model.as_deref(), self.name.as_deref())
+    }
+
+    /// Where the AirPods are, for the menu header.
+    pub fn link_state(&self) -> LinkState {
+        if self.connected {
+            LinkState::Connected
+        } else if self.elsewhere == Some(true)
+            || (self.elsewhere.is_none() && self.nearby && self.in_ear.is_some_and(|(l, r)| l || r))
+        {
+            // Worn but not connected here: they're playing from the phone.
+            LinkState::Elsewhere
+        } else {
+            LinkState::NotConnected
+        }
+    }
+
+    pub fn mode(&self) -> Option<Mode> {
+        self.listening_mode.as_deref().and_then(Mode::parse)
+    }
+
+    /// Listening modes this model offers, in menu order.
+    pub fn modes(&self) -> Vec<Mode> {
+        let mut v = Vec::with_capacity(4);
+        if self.allow_off == Some(true) {
+            v.push(Mode::Off);
+        }
+        v.push(Mode::Anc);
+        v.push(Mode::Transparency);
+        // Adaptive: AirPods Pro 2 (Lightning/USB-C), Pro 3, AirPods 4 ANC.
+        if matches!(self.model_id, None | Some(0x2014 | 0x2024 | 0x2027 | 0x201B)) {
+            v.push(Mode::Adaptive);
+        }
+        v
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LinkState {
+    Connected,
+    Elsewhere,
+    NotConnected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mode {
+    Off,
+    Anc,
+    Transparency,
+    Adaptive,
+}
+
+impl Mode {
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" | "none" => Some(Mode::Off),
+            "anc" | "nc" | "noise_cancellation" | "noise-cancellation" | "noisecancellation" => Some(Mode::Anc),
+            "transparency" | "transparent" => Some(Mode::Transparency),
+            "adaptive" => Some(Mode::Adaptive),
+            _ => None,
+        }
+    }
+
+    /// Argument of the daemon's `mode` command.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Mode::Off => "off",
+            Mode::Anc => "anc",
+            Mode::Transparency => "transparency",
+            Mode::Adaptive => "adaptive",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Off => "Off",
+            Mode::Anc => "Noise Cancellation",
+            Mode::Transparency => "Transparency",
+            Mode::Adaptive => "Adaptive",
+        }
     }
 }
 
@@ -282,6 +380,10 @@ pub fn demo_device(product: Option<&str>) -> Device {
         headphone: None,
         lid_open: Some(true),
         listening_mode: Some("anc".into()),
+        conversational_awareness: Some(true),
+        allow_off: Some(false),
+        in_ear: Some((false, false)),
+        elsewhere: None,
     };
     if dev.product() == Product::Max {
         dev.left = None;
@@ -369,6 +471,39 @@ mod tests {
         let r = rings(&d);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0, RingId::Headphones);
+    }
+
+    #[test]
+    fn menu_fields_and_modes() {
+        let (ev, obj) = parse_line(
+            r#"{"event":"menu","anchor_x":1700,"connected":true,"model_id":8228,"listening_mode":"transparency","conversational_awareness":false,"allow_off":true}"#,
+        )
+        .unwrap();
+        assert_eq!(ev, Event::Menu);
+        let mut d = Device::default();
+        d.apply(&obj);
+        assert_eq!(d.mode(), Some(Mode::Transparency));
+        assert_eq!(d.conversational_awareness, Some(false));
+        assert_eq!(d.modes(), [Mode::Off, Mode::Anc, Mode::Transparency, Mode::Adaptive]);
+        d.allow_off = None;
+        d.model_id = Some(0x200E); // Pro 1: no Adaptive
+        assert_eq!(d.modes(), [Mode::Anc, Mode::Transparency]);
+        d.model_id = None; // unknown: offer it
+        assert!(d.modes().contains(&Mode::Adaptive));
+        assert_eq!(Mode::parse("noise_cancellation"), Some(Mode::Anc));
+    }
+
+    #[test]
+    fn link_states() {
+        let mut d = Device::default();
+        assert_eq!(d.link_state(), LinkState::NotConnected);
+        d.nearby = true;
+        d.in_ear = Some((true, false));
+        assert_eq!(d.link_state(), LinkState::Elsewhere);
+        d.elsewhere = Some(false);
+        assert_eq!(d.link_state(), LinkState::NotConnected, "an explicit flag wins");
+        d.connected = true;
+        assert_eq!(d.link_state(), LinkState::Connected);
     }
 
     #[test]
