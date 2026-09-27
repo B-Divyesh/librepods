@@ -1,649 +1,510 @@
-use crate::bluetooth::aacp::{AACPManager, ControlCommandIdentifiers};
-use iced::Alignment::End;
-use iced::border::Radius;
-use iced::overlay::menu;
-use iced::widget::button::Style;
-use iced::widget::rule::FillMode;
-use iced::widget::{
-    Space, button, column, combo_box, container, row, rule, text, text_input, toggler,
+//! The AirPods pane, modelled on macOS System Settings › AirPods / iOS
+//! Settings › AirPods: a hero card with the product, battery rings and a
+//! Connect button, Control-Center style listening-mode tiles, then grouped
+//! inset lists.
+
+use crate::bluetooth::aacp::{
+    AACPManager, BatteryComponent, BatteryInfo, BatteryStatus, ControlCommandIdentifiers as Id,
 };
-use iced::{Background, Border, Center, Color, Length, Padding, Theme};
-use log::error;
+use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
+use crate::ui::airpods_extra::{self, has_adaptive};
+use crate::ui::style::{self, Pill};
+use crate::ui::window::Message;
+use iced::widget::{Space, column, container, image, row, text, text_input};
+use iced::{Background, Border, Center, Color, Element, Length, Padding, Theme, gradient};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::thread;
-use tokio::runtime::Runtime;
-// use crate::bluetooth::att::ATTManager;
-use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
-use crate::ui::window::Message;
 
+type Level = Option<(u8, bool)>;
+
+pub struct Levels {
+    pub left: Level,
+    pub right: Level,
+    pub case: Level,
+    pub headphone: Level,
+}
+
+/// Battery from the control channel, topped up with the hub (BLE adverts keep
+/// the case level when the buds are out of it).
+pub fn levels(mac: &str, battery: &[BatteryInfo]) -> Levels {
+    let get = |c: BatteryComponent| -> Level {
+        battery
+            .iter()
+            .find(|b| b.component == c && b.status != BatteryStatus::Disconnected)
+            .map(|b| (b.level, b.status == BatteryStatus::Charging))
+    };
+    let mut l = Levels {
+        left: get(BatteryComponent::Left),
+        right: get(BatteryComponent::Right),
+        case: get(BatteryComponent::Case),
+        headphone: get(BatteryComponent::Headphone),
+    };
+    let hub = crate::hub::hub().snapshot();
+    if hub.mac.as_deref() == Some(mac) {
+        let conv = |b: Option<crate::hub::Battery>| b.map(|b| (b.level, b.charging));
+        l.left = l.left.or(conv(hub.left));
+        l.right = l.right.or(conv(hub.right));
+        l.case = l.case.or(conv(hub.case));
+        l.headphone = l.headphone.or(conv(hub.headphone));
+    }
+    l
+}
+
+fn model_of(mac: &str) -> Option<u16> {
+    let hub = crate::hub::hub().snapshot();
+    if hub.mac.as_deref() == Some(mac) || hub.mac.is_none() {
+        hub.model_id
+    } else {
+        None
+    }
+}
+
+fn is_max(model: Option<u16>) -> bool {
+    matches!(model, Some(0x200A | 0x201F | 0x202D))
+}
+
+/// Top card: product picture, status, battery rings, Connect/Disconnect.
+pub fn hero<'a>(
+    theme: &Theme,
+    mac: &str,
+    connected: bool,
+    lv: Levels,
+    model: Option<u16>,
+) -> Element<'a, Message> {
+    let art = style::art(model);
+    let hub = crate::hub::hub().snapshot();
+    let ours = hub.mac.as_deref() == Some(mac);
+
+    let (dot, status): (fn(&Theme) -> Color, &str) = if connected {
+        (style::connected, "Connected")
+    } else if ours && hub.other_host {
+        (style::tertiary, "Connected to another device")
+    } else if ours && hub.nearby {
+        (style::secondary, "Nearby")
+    } else {
+        (style::tertiary, "Not connected")
+    };
+    let status_line = row![
+        container(Space::new())
+            .width(Length::Fixed(7.0))
+            .height(Length::Fixed(7.0))
+            .style(move |t: &Theme| container::Style {
+                background: Some(Background::Color(dot(t))),
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        text(status).font(style::MEDIUM).size(13).style(move |t: &Theme| text::Style {
+            color: Some(if connected { style::connected(t) } else { style::secondary(t) }),
+        }),
+    ]
+    .spacing(7)
+    .align_y(Center);
+
+    // Like iOS: only parts that report a level get a ring.
+    let mut gauges = row![].spacing(22);
+    if is_max(model) {
+        if lv.headphone.is_some() {
+            gauges = gauges.push(style::battery_gauge(theme, "Battery", None, lv.headphone, 64.0));
+        }
+    } else {
+        for (label, part, level) in [
+            ("Left", art.left.clone(), lv.left),
+            ("Right", art.right.clone(), lv.right),
+            ("Case", art.case.clone(), lv.case),
+        ] {
+            if level.is_some() {
+                gauges = gauges.push(style::battery_gauge(theme, label, part, level, 62.0));
+            }
+        }
+    }
+    let has_gauges = lv.headphone.is_some() || lv.left.is_some() || lv.right.is_some() || lv.case.is_some();
+
+    let button = if connected {
+        style::pill("Disconnect", Pill::Secondary, Some(Message::ConnectDevice(mac.to_string(), false)))
+    } else {
+        style::pill("Connect", Pill::Primary, Some(Message::ConnectDevice(mac.to_string(), true)))
+    };
+
+    let mut info = column![status_line].spacing(3).width(Length::Fill);
+    if let Some(id) = model {
+        info = info.push(
+            text(crate::hub::model_name(id))
+                .size(12.5)
+                .style(style::text_color(style::tertiary)),
+        );
+    }
+    info = info.push(Space::new().height(Length::Fixed(14.0)));
+    if has_gauges {
+        info = info
+            .push(gauges)
+            .push(Space::new().height(Length::Fixed(14.0)));
+    }
+    let info = info.push(button);
+
+    container(
+        row![
+            container(
+                image(art.hero.clone())
+                    .height(Length::Fixed(168.0))
+                    .filter_method(image::FilterMethod::Linear)
+            )
+            .center_x(Length::Fixed(190.0)),
+            info,
+        ]
+        .spacing(18)
+        .align_y(Center),
+    )
+    .padding(Padding {
+        top: 20.0,
+        bottom: 20.0,
+        left: 14.0,
+        right: 20.0,
+    })
+    .width(Length::Fill)
+    .style(|t: &Theme| {
+        let mut s = style::card_style(t);
+        let top = style::mix(style::surface(t), style::accent(t), 0.07);
+        s.background = Some(Background::Gradient(
+            gradient::Linear::new(std::f32::consts::PI)
+                .add_stop(0.0, top)
+                .add_stop(1.0, style::surface(t))
+                .into(),
+        ));
+        s.border.radius = 16.0.into();
+        s
+    })
+    .into()
+}
+
+/// Page shown for a known pair of AirPods that isn't connected right now.
+pub fn offline_view<'a>(theme: &Theme, mac: &str, name: String) -> Element<'a, Message> {
+    let model = model_of(mac);
+    let lv = levels(mac, &[]);
+    let content = column![
+        hero(theme, mac, false, lv, model),
+        Space::new().height(Length::Fixed(22.0)),
+        style::section(
+            None,
+            vec![style::list_row(
+                None,
+                "Connect your AirPods to change their settings",
+                Some(
+                    "Open the case nearby or put them in your ears. They reconnect on their own \
+                     if this computer was the last one they used; otherwise press Connect."
+                        .to_string()
+                ),
+                Space::new().into(),
+            )],
+            None,
+        ),
+    ];
+    style::page(name, content.into())
+}
+
+fn mode_caption(mode: u8) -> &'static str {
+    match mode {
+        0x02 => "Noise Cancellation blocks out external sounds.",
+        0x03 => "Transparency lets outside sound in, so you can hear what's going on around you.",
+        0x04 => "Adaptive dynamically blends Transparency and Noise Cancellation to your environment.",
+        _ => "Noise control is off. Loud sounds are not reduced.",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn airpods_view<'a>(
+    theme: &Theme,
     mac: &'a str,
     devices_list: &HashMap<String, DeviceData>,
     state: &'a AirPodsState,
-    aacp_manager: Arc<AACPManager>,
+    aacp: Arc<AACPManager>,
     pause_convo: bool,
-    // att_manager: Arc<ATTManager>
-) -> iced::widget::Container<'a, Message> {
-    let mac = mac.to_string();
-    // order: name, noise control, press and hold config, call controls (not sure if why it might be needed, adding it just in case), audio (personalized volume, conversational awareness, adaptive audio slider), connection settings, microphone, head gestures (not adding this), off listening mode, device information
+) -> Element<'a, Message> {
+    let mac_s = mac.to_string();
+    let model = model_of(mac);
+    let lv = levels(mac, &state.battery);
 
-    let rename_input = container(
-        row![
-            Space::new().width(10),
-            text("Name").size(16).style(|theme: &Theme| {
-                let mut style = text::Style::default();
-                style.color = Some(theme.palette().text);
-                style
-            }),
-            Space::new().width(Length::Fill),
-            text_input("", &state.device_name)
-                .padding(Padding {
-                    top: 5.0,
-                    bottom: 5.0,
-                    left: 10.0,
-                    right: 10.0,
-                })
-                .style(|theme: &Theme, _status| {
-                    text_input::Style {
-                        background: Background::Color(Color::TRANSPARENT),
-                        border: Default::default(),
-                        icon: Default::default(),
-                        placeholder: theme.palette().text.scale_alpha(0.7),
-                        value: theme.palette().text,
-                        selection: Default::default(),
-                    }
-                })
-                .align_x(End)
-                // Rename on Enter, not on every keystroke (each packet renames the buds).
-                .on_input({
-                    let mac = mac.clone();
-                    let state = state.clone();
-                    move |new_name| {
-                        let mut state = state.clone();
-                        state.device_name = new_name.clone();
-                        Message::StateChanged(mac.to_string(), DeviceState::AirPods(state))
-                    }
-                })
-                .on_submit(Message::RenameDevice(mac.clone(), state.device_name.clone()))
-        ]
-        .align_y(Center),
-    )
-    .padding(Padding {
-        top: 5.0,
-        bottom: 5.0,
-        left: 10.0,
-        right: 10.0,
-    })
-    .style(|theme: &Theme| {
-        let mut style = container::Style::default();
-        style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-        let mut border = Border::default();
-        border.color = theme.palette().primary.scale_alpha(0.5);
-        style.border = border.rounded(16);
-        style
-    });
-
-    let listening_mode = container(
-        row![
-            text("Listening Mode").size(16).style(|theme: &Theme| {
-                let mut style = text::Style::default();
-                style.color = Some(theme.palette().text);
-                style
-            }),
-            Space::new().width(Length::Fill),
-            {
-                let state_clone = state.clone();
-                let mac = mac.clone();
-                // this combo_box doesn't go really well with the design, but I am not writing my own dropdown menu for this
-                combo_box(
-                    &state.noise_control_state,
-                    "Select Listening Mode",
-                    Some(&state.noise_control_mode.clone()),
-                    {
-                        let aacp_manager = aacp_manager.clone();
-                        move |selected_mode| {
-                            let aacp_manager = aacp_manager.clone();
-                            let selected_mode_c = selected_mode.clone();
-                            run_async_in_thread(async move {
-                                aacp_manager
-                                    .send_control_command(
-                                        ControlCommandIdentifiers::ListeningMode,
-                                        &[selected_mode_c.to_byte()],
-                                    )
-                                    .await
-                                    .map_err(|e| error!("Failed to send Noise Control Mode command: {}", e)).ok();
-                            });
-                            let mut state = state_clone.clone();
-                            state.noise_control_mode = selected_mode.clone();
-                            Message::StateChanged(mac.to_string(), DeviceState::AirPods(state))
-                        }
-                    },
-                )
-                .width(Length::from(200))
-                .input_style(|theme: &Theme, _status| text_input::Style {
-                    background: Background::Color(theme.palette().primary.scale_alpha(0.2)),
-                    border: Border {
-                        width: 1.0,
-                        color: theme.palette().text.scale_alpha(0.3),
-                        radius: Radius::from(4.0),
-                    },
-                    icon: Default::default(),
-                    placeholder: theme.palette().text,
-                    value: theme.palette().text,
-                    selection: Default::default(),
-                })
-                .padding(Padding {
-                    top: 5.0,
-                    bottom: 5.0,
-                    left: 10.0,
-                    right: 10.0,
-                })
-                .menu_style(|theme: &Theme| menu::Style {
-                    background: Background::Color(theme.palette().background),
-                    border: Border {
-                        width: 1.0,
-                        color: theme.palette().text,
-                        radius: Radius::from(4.0),
-                    },
-                    text_color: theme.palette().text,
-                    selected_text_color: theme.palette().text,
-                    selected_background: Background::Color(
-                        theme.palette().primary.scale_alpha(0.3),
-                    ),
-                    shadow: Default::default(),
-                })
-            }
-        ]
-        .align_y(Center),
-    )
-    .padding(Padding {
-        top: 5.0,
-        bottom: 5.0,
-        left: 18.0,
-        right: 18.0,
-    })
-    .style(|theme: &Theme| {
-        let mut style = container::Style::default();
-        style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-        let mut border = Border::default();
-        border.color = theme.palette().primary.scale_alpha(0.5);
-        style.border = border.rounded(16);
-        style
-    });
-
-    let mac_audio = mac.clone();
-    let mac_information = mac.clone();
-
-    let audio_settings_col = column![
-        container(
-            text("Audio Settings").size(18).style(
-                |theme: &Theme| {
-                    let mut style = text::Style::default();
-                    style.color = Some(theme.palette().primary);
-                    style
-                }
-            )
-        )
-        .padding(Padding{
-            top: 5.0,
-            bottom: 5.0,
-            left: 18.0,
-            right: 18.0,
-        }),
-
-        container(
-            column![
-                {
-                    let aacp_manager_pv = aacp_manager.clone();
-                    row![
-                        column![
-                            text("Personalized Volume").size(16),
-                            text("Adjusts the volume in response to your environment.").size(12).style(
-                                |theme: &Theme| {
-                                    let mut style = text::Style::default();
-                                    style.color = Some(theme.palette().text.scale_alpha(0.7));
-                                    style
-                                }
-                            ).width(Length::Fill),
-                        ].width(Length::Fill),
-                        toggler(state.personalized_volume_enabled)
-                            .on_toggle(
-                            {
-                                let mac = mac_audio.clone();
-                                let state = state.clone();
-                                move |is_enabled| {
-                                    let aacp_manager = aacp_manager_pv.clone();
-                                    let mac = mac.clone();
-                                    run_async_in_thread(
-                                        async move {
-                                            aacp_manager.send_control_command(
-                                                ControlCommandIdentifiers::AdaptiveVolumeConfig,
-                                                if is_enabled { &[0x01] } else { &[0x02] }
-                                            ).await.map_err(|e| error!("Failed to send Personalized Volume command: {}", e)).ok();
-                                        }
-                                    );
-                                    let mut state = state.clone();
-                                    state.personalized_volume_enabled = is_enabled;
-                                    Message::StateChanged(mac, DeviceState::AirPods(state))
-                                }
-                            }
-                        )
-                        .spacing(0)
-                        .size(20)
-                    ]
-                    .align_y(Center)
-                    .spacing(8)
-                },
-                rule::horizontal(1).style(
-                    |theme: &Theme| {
-                        rule::Style {
-                            color: theme.palette().text.scale_alpha(0.2),
-                            radius: Radius::from(12),
-                            fill_mode: FillMode::Full,
-                            snap: false
-                        }
-                    }
-                ),
-                {
-                    let aacp_manager_conv_detect = aacp_manager.clone();
-                    row![
-                        column![
-                            text("Conversation Awareness").size(16),
-                            text("Lowers the volume of your audio when it detects that you are speaking.").size(12).style(
-                                |theme: &Theme| {
-                                    let mut style = text::Style::default();
-                                    style.color = Some(theme.palette().text.scale_alpha(0.7));
-                                    style
-                                }
-                            ).width(Length::Fill),
-                        ].width(Length::Fill),
-                        {
-                            // Locked while a capture manages it, so the user can't fight the override.
-                            let convo_toggler = toggler(state.conversation_awareness_enabled)
-                                .spacing(0)
-                                .size(20);
-                            if pause_convo && aacp_manager.mic_active() {
-                                convo_toggler
-                            } else {
-                                convo_toggler.on_toggle(move |is_enabled| {
-                                    let aacp_manager = aacp_manager_conv_detect.clone();
-                                    run_async_in_thread(
-                                        async move {
-                                            aacp_manager.set_conversation_detection(is_enabled).await;
-                                        }
-                                    );
-                                    let mut state = state.clone();
-                                    state.conversation_awareness_enabled = is_enabled;
-                                    Message::StateChanged(mac_audio.to_string(), DeviceState::AirPods(state))
-                                })
-                            }
-                        }
-                    ]
-                    .align_y(Center)
-                    .spacing(8)
-                }
-            ]
-                .spacing(4)
-                .padding(8)
-        )
-        .padding(Padding{
-            top: 5.0,
-            bottom: 5.0,
-            left: 10.0,
-            right: 10.0,
-        })
-        .style(
-            |theme: &Theme| {
-                let mut style = container::Style::default();
-                style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-                let mut border = Border::default();
-                border.color = theme.palette().primary.scale_alpha(0.5);
-                style.border = border.rounded(16);
-                style
-            }
-        )
+    // ── Noise control ────────────────────────────────────────────────────────
+    let current = state.noise_control_mode.to_byte();
+    // Same per-mode tints as the Waybar pill: ANC amber, Transparency blue, Adaptive gold.
+    type Tint = fn(&Theme) -> Color;
+    let mut modes: Vec<(u8, &'static str, &'static str, Tint)> = vec![
+        (0x02, style::G_ANC, "Noise Cancellation", style::tint_accent),
+        (0x03, style::G_TRANSPARENCY, "Transparency", style::tint_blue),
     ];
-
-    let off_listening_mode_toggle = {
-        let aacp_manager_olm = aacp_manager.clone();
-        let mac = mac.clone();
-        container(row![
-            column![
-                text("Off Listening Mode").size(16),
-                text("When this is on, AirPods listening modes will include an Off option. Loud sound levels are not reduced when listening mode is set to Off.").size(12).style(
-                    |theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text.scale_alpha(0.7));
-                        style
-                    }
-                ).width(Length::Fill)
-            ].width(Length::Fill),
-            toggler(state.allow_off_mode)
-                .on_toggle(move |is_enabled| {
-                    let aacp_manager = aacp_manager_olm.clone();
-                    run_async_in_thread(
-                        async move {
-                            aacp_manager.send_control_command(
-                                ControlCommandIdentifiers::AllowOffOption,
-                                if is_enabled { &[0x01] } else { &[0x02] }
-                            ).await.map_err(|e| error!("Failed to send Off Listening Mode command: {}", e)).ok();
-                        }
-                    );
-                    let mut state = state.clone();
-                    state.allow_off_mode = is_enabled;
-                    Message::StateChanged(mac.to_string(), DeviceState::AirPods(state))
-                })
-            .spacing(0)
-            .size(20)
-        ]
-            .align_y(Center)
-            .spacing(8)
-        )
-            .padding(Padding{
-                top: 5.0,
-                bottom: 5.0,
-                left: 18.0,
-                right: 18.0,
-            })
-            .style(
-                |theme: &Theme| {
-                    let mut style = container::Style::default();
-                    style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-                    let mut border = Border::default();
-                    border.color = theme.palette().primary.scale_alpha(0.5);
-                    style.border = border.rounded(16);
-                    style
-                }
-            )
-    };
-
-    let hires_mic_toggle = {
-        let aacp_manager_mic = aacp_manager.clone();
-        let mac = mac.clone();
-        let state = state.clone();
-        let mic_active = aacp_manager.mic_active();
-        let mic_app = aacp_manager.mic_app();
-        let level = aacp_manager.mic_level().clamp(0.0, 1.0);
-
-        let header = row![
-            column![
-                text("Hi-Res Microphone").size(16),
-                text("Captures the AirPods' high-quality AAC-ELD microphone stream and exposes it as an 'AirPodsHiRes' input.").size(12).style(
-                    |theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text.scale_alpha(0.7));
-                        style
-                    }
-                ).width(Length::Fill)
-            ].width(Length::Fill),
-            toggler(state.hires_mic_enabled)
-                .on_toggle(move |is_enabled| {
-                    let aacp_manager = aacp_manager_mic.clone();
-                    run_async_in_thread(async move {
-                        aacp_manager.set_hires_mic_enabled(is_enabled).await;
-                    });
-                    let mut state = state.clone();
-                    state.hires_mic_enabled = is_enabled;
-                    Message::StateChanged(mac.to_string(), DeviceState::AirPods(state))
-                })
-            .spacing(0)
-            .size(20)
-        ]
-            .align_y(Center)
-            .spacing(8);
-
-        let mut content = column![header].spacing(10);
-        if mic_active {
-            content = content.push(level_meter(level, mic_app));
-        }
-
-        container(content)
-            .padding(Padding {
-                top: 5.0,
-                bottom: 5.0,
-                left: 18.0,
-                right: 18.0,
-            })
-            .style(|theme: &Theme| {
-                let mut style = container::Style::default();
-                style.background =
-                    Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-                let mut border = Border::default();
-                border.color = theme.palette().primary.scale_alpha(0.5);
-                style.border = border.rounded(16);
-                style
-            })
-    };
-
-    let mut information_col = column![];
-    if let Some(device) = devices_list.get(mac_information.as_str()) {
-        if let Some(DeviceInformation::AirPods(ref airpods_info)) = device.information {
-            let info_rows = column![
-                row![
-                    text("Model Number").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    text(airpods_info.model_number.clone()).size(16)
-                ],
-                row![
-                    text("Manufacturer").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    text(airpods_info.manufacturer.clone()).size(16)
-                ],
-                row![
-                    text("Serial Number").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    button(text(airpods_info.serial_number.clone()).size(16))
-                        .style(|theme: &Theme, _status| {
-                            let mut style = Style::default();
-                            style.text_color = theme.palette().text;
-                            style.background = Some(Background::Color(Color::TRANSPARENT));
-                            style
-                        })
-                        .padding(0)
-                        .on_press(Message::CopyToClipboard(airpods_info.serial_number.clone()))
-                ],
-                row![
-                    text("Left Serial Number").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    button(text(airpods_info.left_serial_number.clone()).size(16))
-                        .style(|theme: &Theme, _status| {
-                            let mut style = Style::default();
-                            style.text_color = theme.palette().text;
-                            style.background = Some(Background::Color(Color::TRANSPARENT));
-                            style
-                        })
-                        .padding(0)
-                        .on_press(Message::CopyToClipboard(
-                            airpods_info.left_serial_number.clone()
-                        ))
-                ],
-                row![
-                    text("Right Serial Number").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    button(text(airpods_info.right_serial_number.clone()).size(16))
-                        .style(|theme: &Theme, _status| {
-                            let mut style = Style::default();
-                            style.text_color = theme.palette().text;
-                            style.background = Some(Background::Color(Color::TRANSPARENT));
-                            style
-                        })
-                        .padding(0)
-                        .on_press(Message::CopyToClipboard(
-                            airpods_info.right_serial_number.clone()
-                        ))
-                ],
-                row![
-                    text("Version 1").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    text(airpods_info.version1.clone()).size(16)
-                ],
-                row![
-                    text("Version 2").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    text(airpods_info.version2.clone()).size(16)
-                ],
-                row![
-                    text("Version 3").size(16).style(|theme: &Theme| {
-                        let mut style = text::Style::default();
-                        style.color = Some(theme.palette().text);
-                        style
-                    }),
-                    Space::new().width(Length::Fill),
-                    text(airpods_info.version3.clone()).size(16)
-                ]
-            ]
-            .spacing(4)
-            .padding(8);
-
-            information_col = column![
-                container(text("Device Information").size(18).style(|theme: &Theme| {
-                    let mut style = text::Style::default();
-                    style.color = Some(theme.palette().primary);
-                    style
-                }))
-                .padding(Padding {
-                    top: 5.0,
-                    bottom: 5.0,
-                    left: 18.0,
-                    right: 18.0,
-                }),
-                container(info_rows)
-                    .padding(Padding {
-                        top: 5.0,
-                        bottom: 5.0,
-                        left: 10.0,
-                        right: 10.0,
-                    })
-                    .style(|theme: &Theme| {
-                        let mut style = container::Style::default();
-                        style.background =
-                            Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-                        let mut border = Border::default();
-                        border.color = theme.palette().primary.scale_alpha(0.5);
-                        style.border = border.rounded(16);
-                        style
-                    })
-            ];
-        } else {
-            error!(
-                "Expected AirPodsInformation for device {}, got something else",
-                mac.clone()
-            );
-        }
+    if has_adaptive(model) {
+        modes.push((0x04, style::G_ADAPTIVE, "Adaptive", style::tint_gold));
     }
+    if state.allow_off_mode {
+        modes.push((0x01, style::G_EARBUDS, "Off", style::tint_grey));
+    }
+    let mut tiles = row![].spacing(10);
+    for (byte, glyph, label, tint) in modes {
+        tiles = tiles.push(style::tile(
+            glyph,
+            label,
+            current == byte,
+            tint,
+            Message::SendControl(mac_s.clone(), Id::ListeningMode, vec![byte]),
+        ));
+    }
+    let listening = vec![style::block(tiles.into())];
+    let mut noise = airpods_extra::noise_rows(mac, state, &aacp, model);
 
-    let extra = crate::ui::airpods_extra::extra_settings(&mac, state, aacp_manager.clone());
-    container(column![
-        rename_input,
-        Space::new().height(Length::from(20)),
-        listening_mode,
-        Space::new().height(Length::from(20)),
-        audio_settings_col,
-        Space::new().height(Length::from(20)),
-        off_listening_mode_toggle,
-        Space::new().height(Length::from(20)),
-        extra,
-        Space::new().height(Length::from(20)),
-        hires_mic_toggle,
-        Space::new().height(Length::from(20)),
-        information_col
-    ])
-    .padding(20)
-    .center_x(Length::Fill)
-    .height(Length::Fill)
+    // ── Audio ────────────────────────────────────────────────────────────────
+    let pv = {
+        let st = state.clone();
+        let mac = mac_s.clone();
+        let a = aacp.clone();
+        style::list_row(
+            None,
+            "Personalized Volume",
+            Some("Adjusts the volume of media in response to your environment.".into()),
+            style::switch(state.personalized_volume_enabled)
+                .on_toggle(move |on| {
+                    airpods_extra::send(&a, Id::AdaptiveVolumeConfig, vec![if on { 1 } else { 2 }]);
+                    let mut st = st.clone();
+                    st.personalized_volume_enabled = on;
+                    Message::StateChanged(mac.clone(), DeviceState::AirPods(st))
+                })
+                .into(),
+        )
+    };
+    let ca = {
+        let st = state.clone();
+        let mac = mac_s.clone();
+        let a = aacp.clone();
+        let locked = pause_convo && aacp.mic_active();
+        let t = style::switch(state.conversation_awareness_enabled);
+        let t = if locked {
+            t
+        } else {
+            t.on_toggle(move |on| {
+                let a2 = a.clone();
+                a.runtime().spawn(async move { a2.set_conversation_detection(on).await });
+                let mut st = st.clone();
+                st.conversation_awareness_enabled = on;
+                Message::StateChanged(mac.clone(), DeviceState::AirPods(st))
+            })
+        };
+        style::list_row(
+            None,
+            "Conversation Awareness",
+            Some(if locked {
+                "Paused while the hi-res microphone is capturing.".into()
+            } else {
+                "Lowers media volume and reduces background noise when you start speaking.".into()
+            }),
+            t.into(),
+        )
+    };
+    let off = {
+        let st = state.clone();
+        let mac = mac_s.clone();
+        let a = aacp.clone();
+        style::list_row(
+            None,
+            "Off Listening Mode",
+            Some("Adds Off to the listening modes. Loud sounds aren't reduced when Off.".into()),
+            style::switch(state.allow_off_mode)
+                .on_toggle(move |on| {
+                    airpods_extra::send(&a, Id::AllowOffOption, vec![if on { 1 } else { 2 }]);
+                    let mut st = st.clone();
+                    st.allow_off_mode = on;
+                    Message::StateChanged(mac.clone(), DeviceState::AirPods(st))
+                })
+                .into(),
+        )
+    };
+
+    // ── General: name first ──────────────────────────────────────────────────
+    let name_row = {
+        let st = state.clone();
+        let mac = mac_s.clone();
+        style::list_row(
+            None,
+            "Name",
+            None,
+            text_input("AirPods", &state.device_name)
+                .on_input(move |new_name| {
+                    let mut st = st.clone();
+                    st.device_name = new_name;
+                    Message::StateChanged(mac.clone(), DeviceState::AirPods(st))
+                })
+                // Rename on Enter, not per keystroke (each packet renames the buds).
+                .on_submit(Message::RenameDevice(mac_s.clone(), state.device_name.clone()))
+                .align_x(iced::alignment::Horizontal::Right)
+                .size(13.5)
+                .padding(Padding {
+                    top: 4.0,
+                    bottom: 4.0,
+                    left: 8.0,
+                    right: 0.0,
+                })
+                .width(Length::Fixed(220.0))
+                .style(style::field_style)
+                .into(),
+        )
+    };
+    let mut general = vec![name_row];
+    general.extend(airpods_extra::general_rows(mac, state, &aacp, model));
+    noise.push(off);
+
+    // ── Hi-res microphone ────────────────────────────────────────────────────
+    let mic = {
+        let st = state.clone();
+        let mac = mac_s.clone();
+        let a = aacp.clone();
+        let mut rows = vec![airpods_extra::mic_side_row(&mac, state, &aacp), style::list_row(
+            None,
+            "Hi-Res Microphone",
+            Some(
+                "Streams the AirPods' AAC-ELD microphone as an \u{201c}AirPodsHiRes\u{201d} input, \
+                 so music keeps playing in high quality while you talk."
+                    .into(),
+            ),
+            style::switch(state.hires_mic_enabled)
+                .on_toggle(move |on| {
+                    let a2 = a.clone();
+                    a.runtime().spawn(async move { a2.set_hires_mic_enabled(on).await });
+                    let mut st = st.clone();
+                    st.hires_mic_enabled = on;
+                    Message::StateChanged(mac.clone(), DeviceState::AirPods(st))
+                })
+                .into(),
+        )];
+        if aacp.mic_active() {
+            rows.push(style::block(level_meter(
+                aacp.mic_level().clamp(0.0, 1.0),
+                aacp.mic_app(),
+            )));
+        }
+        rows
+    };
+
+    // ── About ────────────────────────────────────────────────────────────────
+    let mut about: Vec<Element<'a, Message>> = Vec::new();
+    if let Some(DeviceInformation::AirPods(info)) =
+        devices_list.get(mac).and_then(|d| d.information.clone())
+    {
+        let plain = |label: &'static str, v: String| -> Option<Element<'a, Message>> {
+            (!v.is_empty()).then(|| style::list_row(None, label, None, style::value(v)))
+        };
+        let copyable = |label: &'static str, v: String| -> Option<Element<'a, Message>> {
+            (!v.is_empty()).then(|| {
+                style::list_row(
+                    None,
+                    label,
+                    None,
+                    style::plain_button(
+                        row![
+                            text(v.clone()).size(13.5),
+                            text(style::G_COPY).font(style::GLYPHS).size(12),
+                        ]
+                        .spacing(6)
+                        .align_y(Center)
+                        .into(),
+                        Message::CopyToClipboard(v),
+                    ),
+                )
+            })
+        };
+        about.extend(
+            [
+                plain("Model Number", info.model_number.clone()),
+                plain("Manufacturer", info.manufacturer.clone()),
+                copyable("Serial Number", info.serial_number.clone()),
+                copyable("Left Serial Number", info.left_serial_number.clone()),
+                copyable("Right Serial Number", info.right_serial_number.clone()),
+                plain("Firmware", info.version1.clone()),
+                (info.version2 != info.version1)
+                    .then(|| plain("Firmware (build)", info.version2.clone()))
+                    .flatten(),
+                plain("Hardware Revision", info.hardware_revision.clone()),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    }
+    about.push(style::list_row(None, "Bluetooth Address", None, style::value(mac_s.clone())));
+
+    let selected_caption = mode_caption(current).to_string();
+    let mut content = column![
+        hero(theme, mac, true, lv, model),
+        Space::new().height(Length::Fixed(24.0)),
+        style::section(Some("Listening Mode"), listening, Some(selected_caption)),
+        style::section(Some("Noise Control"), noise, None),
+        style::section(Some("Audio"), vec![pv, ca], None),
+    ];
+    if !is_max(model) {
+        content = content.push(style::section(
+            Some("Press and Hold"),
+            airpods_extra::press_rows(mac, state, &aacp, model),
+            None,
+        ));
+    }
+    content = content
+        .push(style::section(
+            Some("Call Controls"),
+            airpods_extra::call_rows(mac, state, &aacp),
+            None,
+        ))
+        .push(style::section(Some("General"), general, None))
+        .push(style::section(
+            Some("Microphone"),
+            mic,
+            Some("Capture starts only while an app records from the AirPodsHiRes input.".into()),
+        ))
+        .push(style::section(Some("About"), about, None));
+
+    style::page(state.device_name.clone(), content.into())
 }
 
-fn level_meter<'a>(level: f32, app: Option<String>) -> iced::widget::Container<'a, Message> {
-    let filled = (level * 1000.0).round() as u16;
-    let rest = 1000u16.saturating_sub(filled);
+fn level_meter<'a>(level: f32, app: Option<String>) -> Element<'a, Message> {
+    let filled = ((level * 1000.0).round() as u16).max(1);
+    let rest = 1000u16.saturating_sub(filled).max(1);
     let hot = level >= 0.9;
     let label = match app {
-        Some(app) => format!("In use by {}", app),
+        Some(app) => format!("In use by {app}"),
         None => "Input level".to_string(),
     };
-
     let bar = container(
         row![
             container(Space::new())
                 .width(Length::FillPortion(filled))
                 .height(Length::Fill)
-                .style(move |theme: &Theme| {
-                    let mut s = container::Style::default();
-                    let color = if hot {
-                        theme.palette().warning
+                .style(move |t: &Theme| container::Style {
+                    background: Some(Background::Color(if hot {
+                        t.palette().warning
                     } else {
-                        theme.palette().success
-                    };
-                    s.background = Some(Background::Color(color));
-                    s.border = Border::default().rounded(4);
-                    s
+                        t.palette().success
+                    })),
+                    border: Border {
+                        radius: 3.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
                 }),
             container(Space::new()).width(Length::FillPortion(rest)),
         ]
         .height(Length::Fill),
     )
     .width(Length::Fill)
-    .height(Length::from(10))
-    .style(|theme: &Theme| {
-        let mut s = container::Style::default();
-        s.background = Some(Background::Color(theme.palette().text.scale_alpha(0.12)));
-        s.border = Border::default().rounded(4);
-        s
+    .height(Length::Fixed(6.0))
+    .style(|t: &Theme| container::Style {
+        background: Some(Background::Color(t.palette().text.scale_alpha(0.1))),
+        border: Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
     });
-
-    container(
-        column![
-            text(label).size(12).style(|theme: &Theme| {
-                let mut style = text::Style::default();
-                style.color = Some(theme.palette().text.scale_alpha(0.7));
-                style
-            }),
-            bar,
-        ]
-        .spacing(4),
-    )
-    .width(Length::Fill)
-    .padding(Padding {
-        bottom: 6.0,
-        ..Padding::ZERO
-    })
-}
-
-fn run_async_in_thread<F>(fut: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(fut);
-    });
+    column![
+        text(label).size(12).style(style::text_color(style::secondary)),
+        bar
+    ]
+    .spacing(6)
+    .into()
 }

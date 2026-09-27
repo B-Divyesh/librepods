@@ -160,6 +160,8 @@ pub fn ah(k: &[u8; 16], r: &[u8; 3]) -> [u8; 3] {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MyTheme {
+    /// The desktop's own palette (Waybar/mako "Ember").
+    Ember,
     Light,
     Dark,
     Dracula,
@@ -187,6 +189,7 @@ pub enum MyTheme {
 impl std::fmt::Display for MyTheme {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Ember => "Ember",
             Self::Light => "Light",
             Self::Dark => "Dark",
             Self::Dracula => "Dracula",
@@ -246,7 +249,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            theme: MyTheme::Dark,
+            theme: MyTheme::Ember,
             tray_text_mode: false,
             stem_control: false,
             hires_mic_enabled: false,
@@ -291,9 +294,55 @@ impl AppSettings {
     }
 }
 
+impl MyTheme {
+    pub const ALL: [MyTheme; 23] = [
+        Self::Ember,
+        Self::Light,
+        Self::Dark,
+        Self::Dracula,
+        Self::Nord,
+        Self::SolarizedLight,
+        Self::SolarizedDark,
+        Self::GruvboxLight,
+        Self::GruvboxDark,
+        Self::CatppuccinLatte,
+        Self::CatppuccinFrappe,
+        Self::CatppuccinMacchiato,
+        Self::CatppuccinMocha,
+        Self::TokyoNight,
+        Self::TokyoNightStorm,
+        Self::TokyoNightLight,
+        Self::KanagawaWave,
+        Self::KanagawaDragon,
+        Self::KanagawaLotus,
+        Self::Moonfly,
+        Self::Nightfly,
+        Self::Oxocarbon,
+        Self::Ferra,
+    ];
+}
+
+/// Ember: the Hyprland/Waybar/mako palette of this desktop.
+pub fn ember_theme() -> Theme {
+    use iced::Color;
+    static EMBER: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    EMBER.get_or_init(|| Theme::custom(
+        "Ember",
+        iced::theme::Palette {
+            background: Color::from_rgb8(0x1a, 0x14, 0x1b),
+            text: Color::from_rgb8(0xf0, 0xe4, 0xd4),
+            primary: Color::from_rgb8(0xe8, 0x9b, 0x5e),
+            success: Color::from_rgb8(0xa8, 0xc6, 0x86),
+            warning: Color::from_rgb8(0xef, 0xcf, 0x9f),
+            danger: Color::from_rgb8(0xe5, 0x53, 0x4b),
+        },
+    )).clone()
+}
+
 impl From<MyTheme> for Theme {
     fn from(my_theme: MyTheme) -> Self {
         match my_theme {
+            MyTheme::Ember => ember_theme(),
             MyTheme::Light => Theme::Light,
             MyTheme::Dark => Theme::Dark,
             MyTheme::Dracula => Theme::Dracula,

@@ -126,6 +126,18 @@ pub async fn run() {
     let mut rx = hub().subscribe();
     let mut low: HashMap<&'static str, LowState> = HashMap::new();
     let mut connected_note: u32 = 0;
+    // Never repeat the same card within a minute (reconnect blips, restarts).
+    let mut last_shown: HashMap<&'static str, std::time::Instant> = HashMap::new();
+    let mut recently = |key: &'static str, secs: u64| -> bool {
+        let now = std::time::Instant::now();
+        let hit = last_shown
+            .get(key)
+            .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(secs));
+        if !hit {
+            last_shown.insert(key, now);
+        }
+        hit
+    };
     loop {
         let ev: Event = match rx.recv().await {
             Ok(ev) => ev,
@@ -135,7 +147,11 @@ pub async fn run() {
         let settings = AppSettings::load();
         let s = ev.status.clone();
         match ev.event {
-            "connected" if settings.connect_popup && !POPUP_RUNNING.load(Ordering::Relaxed) => {
+            "connected"
+                if settings.connect_popup
+                    && !POPUP_RUNNING.load(Ordering::Relaxed)
+                    && !recently("connected", 60) =>
+            {
                 let name = s.name.clone().unwrap_or_else(|| "AirPods".into());
                 let body = battery_line(&s);
                 let id = tokio::task::spawn_blocking(move || {
@@ -177,7 +193,7 @@ pub async fn run() {
                         app: "osd",
                         replaces: 0,
                         icon: String::new(),
-                        summary: format!("{glyph}  {text}"),
+                        summary: format!("{glyph}   {text}"),
                         body: String::new(),
                         timeout_ms: 1400,
                         urgency: 0,
@@ -186,6 +202,33 @@ pub async fn run() {
                         category: None,
                     })
                 });
+            }
+            "lid_open" | "popup"
+                if (settings.case_popup || ev.event == "popup")
+                    && !POPUP_RUNNING.load(Ordering::Relaxed)
+                    && (ev.event == "popup" || !recently("case", 10)) =>
+            {
+                let name = s.name.clone().unwrap_or_else(|| "AirPods".into());
+                let status = if s.connected { "Connected" } else { "Not connected — middle-click the bar icon to connect" };
+                let body = format!("{}\n{}", battery_line(&s), status);
+                tokio::task::spawn_blocking(move || {
+                    send(Note {
+                        app: APP,
+                        replaces: 0,
+                        icon: icon_path(),
+                        summary: name,
+                        body,
+                        timeout_ms: 6000,
+                        urgency: 1,
+                        sync_tag: Some("librepods-case"),
+                        value: None,
+                        category: Some("device"),
+                    })
+                });
+            }
+            "connect_failed" => {
+                let name = s.name.clone().unwrap_or_else(|| "AirPods".into());
+                toast(format!("\u{f1851}   Couldn't connect to {name}"));
             }
             "disconnected" => {
                 low.clear();
@@ -235,6 +278,24 @@ pub async fn run() {
             }
         }
     }
+}
+
+/// Small bottom-centre OSD toast, same look as the volume/caffeine ones.
+pub fn toast(text: String) {
+    tokio::task::spawn_blocking(move || {
+        send(Note {
+            app: "osd",
+            replaces: 0,
+            icon: String::new(),
+            summary: text,
+            body: String::new(),
+            timeout_ms: 1500,
+            urgency: 0,
+            sync_tag: Some("librepods-mode"),
+            value: None,
+            category: None,
+        })
+    });
 }
 
 fn mode_glyph(m: ListeningMode) -> &'static str {

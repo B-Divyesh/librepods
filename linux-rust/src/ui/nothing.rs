@@ -1,12 +1,9 @@
 use crate::bluetooth::att::{ATTHandles, ATTManager};
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceState, NothingState};
+use crate::ui::style;
 use crate::ui::window::Message;
-use iced::border::Radius;
-use iced::overlay::menu;
-use iced::widget::combo_box;
-use iced::widget::text_input;
-use iced::widget::{Space, column, container, row, text};
-use iced::{Background, Border, Length, Theme};
+use iced::widget::{Space, column, combo_box, text_input};
+use iced::{Background, Border, Element, Length, Padding, Theme};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -17,165 +14,86 @@ pub fn nothing_view<'a>(
     devices_list: &HashMap<String, DeviceData>,
     state: &'a NothingState,
     att_manager: Arc<ATTManager>,
-) -> iced::widget::Container<'a, Message> {
-    let mut information_col = iced::widget::column![];
+) -> Element<'a, Message> {
     let mac = mac.to_string();
-    if let Some(device) = devices_list.get(mac.as_str())
-        && let Some(DeviceInformation::Nothing(ref nothing_info)) = device.information
-    {
-        information_col = information_col
-            .push(text("Device Information").size(18).style(|theme: &Theme| {
-                let mut style = text::Style::default();
-                style.color = Some(theme.palette().primary);
-                style
-            }))
-            .push(Space::new().height(iced::Length::from(10)))
-            .push(iced::widget::row![
-                text("Serial Number").size(16).style(|theme: &Theme| {
-                    let mut style = text::Style::default();
-                    style.color = Some(theme.palette().text);
-                    style
-                }),
-                Space::new().width(Length::Fill),
-                text(nothing_info.serial_number.clone()).size(16)
-            ])
-            .push(iced::widget::row![
-                text("Firmware Version").size(16).style(|theme: &Theme| {
-                    let mut style = text::Style::default();
-                    style.color = Some(theme.palette().text);
-                    style
-                }),
-                Space::new().width(Length::Fill),
-                text(nothing_info.firmware_version.clone()).size(16)
-            ]);
-    }
+    let name = devices_list
+        .get(mac.as_str())
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "Nothing".to_string());
 
-    let noise_control_mode = container(
-        row![
-            text("Noise Control Mode").size(16).style(|theme: &Theme| {
-                let mut style = text::Style::default();
-                style.color = Some(theme.palette().text);
-                style
-            }),
-            Space::new().width(Length::Fill),
-            {
-                let state_clone = state.clone();
-                let mac = mac.clone();
-                let att_manager_clone = att_manager.clone();
-                combo_box(
-                    &state.anc_mode_state,
-                    "Select Noise Control Mode",
-                    Some(&state.anc_mode.clone()),
+    let mode_picker = {
+        let state_clone = state.clone();
+        let mac = mac.clone();
+        let att = att_manager.clone();
+        combo_box(
+            &state.anc_mode_state,
+            "Noise control",
+            Some(&state.anc_mode),
+            move |selected_mode| {
+                let att = att.clone();
+                let byte = selected_mode.to_byte();
+                let mac_s = mac.clone();
+                run_async_in_thread(async move {
+                    if let Err(e) = att
+                        .write(
+                            ATTHandles::NothingEverything,
+                            &[
+                                0x55, 0x60, 0x01, 0x0F, 0xF0, 0x03, 0x00, 0x00, 0x01, byte, 0x00,
+                                0x00, 0x00,
+                            ],
+                        )
+                        .await
                     {
-                        move |selected_mode| {
-                            let att_manager = att_manager_clone.clone();
-                            let selected_mode_c = selected_mode.clone();
-                            let mac_s = mac.clone();
-                            run_async_in_thread(async move {
-                                if let Err(e) = att_manager
-                                    .write(
-                                        ATTHandles::NothingEverything,
-                                        &[
-                                            0x55,
-                                            0x60,
-                                            0x01,
-                                            0x0F,
-                                            0xF0,
-                                            0x03,
-                                            0x00,
-                                            0x00,
-                                            0x01,
-                                            selected_mode_c.to_byte(),
-                                            0x00,
-                                            0x00,
-                                            0x00,
-                                        ],
-                                    )
-                                    .await
-                                {
-                                    log::error!(
-                                        "Failed to set noise cancellation mode for device {}: {}",
-                                        mac_s,
-                                        e
-                                    );
-                                }
-                            });
-                            let mut state = state_clone.clone();
-                            state.anc_mode = selected_mode.clone();
-                            Message::StateChanged(mac.to_string(), DeviceState::Nothing(state))
-                        }
-                    },
-                )
-                .width(Length::from(200))
-                .input_style(|theme: &Theme, _status| text_input::Style {
-                    background: Background::Color(theme.palette().primary.scale_alpha(0.2)),
-                    border: Border {
-                        width: 1.0,
-                        color: theme.palette().text.scale_alpha(0.3),
-                        radius: Radius::from(4.0),
-                    },
-                    icon: Default::default(),
-                    placeholder: theme.palette().text,
-                    value: theme.palette().text,
-                    selection: Default::default(),
-                })
-                .padding(iced::Padding {
-                    top: 5.0,
-                    bottom: 5.0,
-                    left: 10.0,
-                    right: 10.0,
-                })
-                .menu_style(|theme: &Theme| menu::Style {
-                    background: Background::Color(theme.palette().background),
-                    border: Border {
-                        width: 1.0,
-                        color: theme.palette().text,
-                        radius: Radius::from(4.0),
-                    },
-                    text_color: theme.palette().text,
-                    selected_text_color: theme.palette().text,
-                    selected_background: Background::Color(
-                        theme.palette().primary.scale_alpha(0.3),
-                    ),
-                    shadow: Default::default()
-                })
-            }
-        ]
-        .align_y(iced::Alignment::Center),
-    )
-    .padding(iced::Padding {
-        top: 5.0,
-        bottom: 5.0,
-        left: 18.0,
-        right: 18.0,
-    })
-    .style(|theme: &Theme| {
-        let mut style = container::Style::default();
-        style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-        let mut border = Border::default();
-        border.color = theme.palette().primary.scale_alpha(0.5);
-        style.border = border.rounded(16);
-        style
-    });
+                        log::error!("Failed to set noise control for {}: {}", mac_s, e);
+                    }
+                });
+                let mut state = state_clone.clone();
+                state.anc_mode = selected_mode;
+                Message::StateChanged(mac.to_string(), DeviceState::Nothing(state))
+            },
+        )
+        .width(Length::Fixed(230.0))
+        .size(13.0)
+        .padding(Padding {
+            top: 5.0,
+            bottom: 5.0,
+            left: 10.0,
+            right: 10.0,
+        })
+        .input_style(|t: &Theme, _status| text_input::Style {
+            background: Background::Color(style::control(t)),
+            border: Border {
+                width: 0.0,
+                color: iced::Color::TRANSPARENT,
+                radius: 8.0.into(),
+            },
+            icon: style::secondary(t),
+            placeholder: style::tertiary(t),
+            value: t.palette().text,
+            selection: style::accent(t).scale_alpha(0.4),
+        })
+        .menu_style(style::menu_style)
+    };
 
-    container(column![
-        noise_control_mode,
-        Space::new().height(Length::from(20)),
-        container(information_col)
-            .style(|theme: &Theme| {
-                let mut style = container::Style::default();
-                style.background =
-                    Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-                let mut border = Border::default();
-                border.color = theme.palette().text;
-                style.border = border.rounded(20);
-                style
-            })
-            .padding(20)
-    ])
-    .padding(20)
-    .center_x(Length::Fill)
-    .height(Length::Fill)
+    let mut about: Vec<Element<'a, Message>> = Vec::new();
+    if let Some(DeviceInformation::Nothing(info)) =
+        devices_list.get(mac.as_str()).and_then(|d| d.information.clone())
+    {
+        about.push(style::list_row(None, "Serial Number", None, style::value(info.serial_number)));
+        about.push(style::list_row(None, "Firmware", None, style::value(info.firmware_version)));
+    }
+    about.push(style::list_row(None, "Bluetooth Address", None, style::value(mac.clone())));
+
+    let content = column![
+        style::section(
+            Some("Noise Control"),
+            vec![style::list_row(None, "Mode", None, mode_picker.into())],
+            None,
+        ),
+        style::section(Some("About"), about, None),
+        Space::new().height(Length::Fixed(0.0)),
+    ];
+    style::page(name, content.into())
 }
 
 fn run_async_in_thread<F>(fut: F)

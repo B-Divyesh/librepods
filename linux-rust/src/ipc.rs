@@ -88,6 +88,7 @@ async fn handle(stream: UnixStream) -> std::io::Result<()> {
             let mut rx = hub().subscribe();
             let first = Event {
                 event: "status",
+                anchor_x: None,
                 status: hub().snapshot(),
             };
             w.write_all(format!("{}\n", serde_json::to_string(&first)?).as_bytes())
@@ -97,6 +98,7 @@ async fn handle(stream: UnixStream) -> std::io::Result<()> {
                     Ok(ev) => ev,
                     Err(RecvError::Lagged(_)) => Event {
                         event: "status",
+                        anchor_x: None,
                         status: hub().snapshot(),
                     },
                     Err(RecvError::Closed) => return Ok(()),
@@ -180,7 +182,13 @@ async fn run(cmd: &str, arg: &str) -> String {
                 hub().emit("connecting");
             }
             match bluetoothctl(action, &mac).await {
-                Ok(()) => ok(),
+                Ok(()) => {
+                    if action == "disconnect" {
+                        let name = st.name.clone().unwrap_or_else(|| "AirPods".into());
+                        crate::notify::toast(format!("{G_EARBUDS_OFF}   {name} disconnected"));
+                    }
+                    ok()
+                }
                 Err(e) => {
                     if action == "connect" {
                         hub().emit("connect_failed");
@@ -208,10 +216,22 @@ async fn run(cmd: &str, arg: &str) -> String {
             hub().emit("popup");
             ok()
         }
+        "menu" => {
+            // The dropdown lives in librepods-popup; without it, open the window.
+            if crate::notify::POPUP_RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+                hub().emit_menu(arg.parse().ok());
+                ok()
+            } else {
+                match hub().send_ui(BluetoothUIMessage::OpenWindow) {
+                    Ok(()) => ok(),
+                    Err(e) => err(e),
+                }
+            }
+        }
         "help" | "" => json!({"commands": [
             "status", "watch", "mode off|anc|transparency|adaptive|next", "ca on|off|toggle",
             "bluetooth on|off|toggle",
-            "connect", "disconnect", "toggle", "open", "popup"]})
+            "connect", "disconnect", "toggle", "bluetooth on|off|toggle", "open", "popup", "menu [x]"]})
         .to_string(),
         other => err(format!("unknown command '{other}'")),
     }
@@ -294,6 +314,30 @@ pub fn run_client(args: &[String]) -> i32 {
     let cmd = args.first().map(String::as_str).unwrap_or("status");
     match cmd {
         "waybar" => waybar_loop(),
+        "menu" => {
+            // Hang the menu under the pointer (the bar icon that was clicked).
+            let x = std::process::Command::new("hyprctl")
+                .arg("cursorpos")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .split(',')
+                        .next()
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                })
+                .map(|v| v.round() as i32);
+            let Some(stream) = connect_or_report() else { return 1 };
+            let mut w = &stream;
+            let cmd = match x {
+                Some(x) => format!("menu {x}\n"),
+                None => "menu\n".to_string(),
+            };
+            let _ = w.write_all(cmd.as_bytes());
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            0
+        }
         "watch" => {
             let Some(stream) = connect_or_report() else { return 1 };
             let mut w = &stream;
@@ -330,6 +374,22 @@ pub fn run_client(args: &[String]) -> i32 {
 fn connect_or_report() -> Option<std::os::unix::net::UnixStream> {
     match std::os::unix::net::UnixStream::connect(socket_path()) {
         Ok(s) => Some(s),
+        Err(_) if std::env::args().any(|a| a == "open") => {
+            // Launched from the app menu while not running: start the service
+            // and wait for its socket.
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "start", "librepods.service"])
+                .status();
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(100));
+                if let Ok(s) = std::os::unix::net::UnixStream::connect(socket_path()) {
+                    std::thread::sleep(Duration::from_millis(400));
+                    return Some(s);
+                }
+            }
+            eprintln!("librepods: could not start the service");
+            None
+        }
         Err(_) => {
             eprintln!("librepods: not running (no {})", socket_path().display());
             None
@@ -454,13 +514,22 @@ fn waybar_json(v: &serde_json::Value) -> String {
         classes.push("lid-open");
     }
 
-    // Tooltip, Mac "Bluetooth" menu style.
+    // Tooltip: "Name  ·  state" header like the other bar modules.
     let name = st.name.clone().unwrap_or_else(|| "AirPods".into());
-    let mut tip = format!("<b>{}</b>", glib_escape(&name));
+    let state = if st.connected {
+        "Connected"
+    } else if st.other_host {
+        "On another device"
+    } else if st.nearby {
+        "Nearby"
+    } else {
+        "Not connected"
+    };
+    let mut tip = format!("<b>{}</b>  ·  {}", glib_escape(&name), state);
     if let Some(model) = &st.model
         && *model != name
     {
-        tip += &format!("  <span alpha='60%'>{}</span>", glib_escape(model));
+        tip += &format!("\n<span alpha='60%'>{}</span>", glib_escape(model));
     }
     tip += "\n";
     let row = |label: &str, b: Option<Battery>| -> String {
@@ -507,11 +576,11 @@ fn waybar_json(v: &serde_json::Value) -> String {
                 ear(st.in_ear.right)
             );
         }
-        tip += "\n\n<span alpha='60%'>click: settings · right: mode · middle: disconnect</span>";
+        tip += "\n\n<span alpha='60%'>click: menu · right: next mode · middle: disconnect</span>";
     } else if st.other_host {
-        tip += "\nConnected to another device\n\n<span alpha='60%'>middle-click to take over</span>";
+        tip += "\n<span alpha='60%'>click: menu · middle: take over</span>";
     } else {
-        tip += "\nNot connected\n\n<span alpha='60%'>middle-click to connect</span>";
+        tip += "\n<span alpha='60%'>click: menu · middle: connect</span>";
     }
 
     json!({

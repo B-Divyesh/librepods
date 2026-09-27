@@ -164,6 +164,9 @@ pub fn model_name(id: u16) -> &'static str {
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub event: &'static str,
+    /// For "menu": x (logical px) of the bar icon the menu hangs under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_x: Option<i32>,
     #[serde(flatten)]
     pub status: Status,
 }
@@ -171,6 +174,9 @@ pub struct Event {
 type CommandTx = UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>;
 
 pub struct Hub {
+    /// Set for connections that already existed when we started, so no
+    /// "connected" card pops up at login / service restart.
+    quiet_connect: std::sync::atomic::AtomicBool,
     status: Mutex<Status>,
     events: broadcast::Sender<Event>,
     command_tx: Mutex<Option<CommandTx>>,
@@ -181,6 +187,7 @@ static HUB: OnceLock<Hub> = OnceLock::new();
 
 pub fn hub() -> &'static Hub {
     HUB.get_or_init(|| Hub {
+        quiet_connect: std::sync::atomic::AtomicBool::new(false),
         status: Mutex::new(Status {
             auto_connect: true,
             ..Default::default()
@@ -206,12 +213,39 @@ impl Hub {
         };
         let _ = self.events.send(Event {
             event,
+            anchor_x: None,
             status: snapshot,
         });
     }
 
+    pub fn set_quiet_connect(&self) {
+        self.quiet_connect.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn clear_quiet_connect(&self) {
+        self.quiet_connect.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Emit "connected", or just a status update for a pre-existing connection.
+    pub fn announce_connected(&self) {
+        if self.quiet_connect.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.update("status", |_| {});
+        } else {
+            self.emit("connected");
+        }
+    }
+
     pub fn emit(&self, event: &'static str) {
         self.update(event, |_| {});
+    }
+
+    /// Ask the popup process to drop down the bar menu under `x`.
+    pub fn emit_menu(&self, x: Option<i32>) {
+        let _ = self.events.send(Event {
+            event: "menu",
+            anchor_x: x,
+            status: self.snapshot(),
+        });
     }
 
     pub fn snapshot(&self) -> Status {

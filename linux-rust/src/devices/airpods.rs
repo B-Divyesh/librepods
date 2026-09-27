@@ -52,13 +52,16 @@ impl AirPodsDevice {
                 s.name = Some(n.clone());
             }
         });
+        if !control_up {
+            hub().clear_quiet_connect();
+        }
         let announced = Arc::new(AtomicBool::new(!control_up));
         {
             let announced = announced.clone();
             tokio::spawn(async move {
                 sleep(Duration::from_millis(1500)).await;
                 if !announced.swap(true, Ordering::SeqCst) {
-                    hub().emit("connected");
+                    hub().announce_connected();
                 }
             });
         }
@@ -340,7 +343,7 @@ impl AirPodsDevice {
                             }
                         });
                         if !announced_ev.swap(true, Ordering::SeqCst) {
-                            hub().emit("connected");
+                            hub().announce_connected();
                         }
                         if let Some(handle) = &tray_handle {
                             handle

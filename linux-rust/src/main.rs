@@ -249,6 +249,7 @@ async fn async_main(
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
             info!("Found connected AirPods: {}, initializing.", name);
+            hub::hub().set_quiet_connect();
             ensure_device_registered(
                 &device.address().to_string(),
                 &name,
@@ -534,21 +535,32 @@ fn spawn_popup() {
         return;
     };
     tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut backoff = std::time::Duration::from_secs(5);
         loop {
             match tokio::process::Command::new(&path).kill_on_drop(true).spawn() {
                 Ok(mut child) => {
-                    info!("Started {}", path.display());
-                    notify::POPUP_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let started = std::time::Instant::now();
+                    notify::POPUP_RUNNING.store(true, Relaxed);
                     let status = child.wait().await;
-                    notify::POPUP_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
-                    warn!("librepods-popup exited ({:?}), restarting in 5 s", status);
+                    if started.elapsed() < std::time::Duration::from_secs(3) {
+                        // Exited at once: most likely another copy already
+                        // owns the session lock. It still shows the cards, so
+                        // keep POPUP_RUNNING and check back slowly.
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
+                        debug!("librepods-popup exited immediately ({:?}); retry in {:?}", status, backoff);
+                    } else {
+                        notify::POPUP_RUNNING.store(false, Relaxed);
+                        backoff = std::time::Duration::from_secs(5);
+                        warn!("librepods-popup exited ({:?}), restarting in 5 s", status);
+                    }
                 }
                 Err(e) => {
                     warn!("Cannot start {}: {}", path.display(), e);
                     return;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(backoff).await;
         }
     });
 }
