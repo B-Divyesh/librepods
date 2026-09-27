@@ -1,7 +1,10 @@
 mod audio;
 mod bluetooth;
 mod devices;
+mod hub;
+mod ipc;
 mod media_controller;
+mod notify;
 mod ui;
 mod utils;
 
@@ -44,11 +47,19 @@ struct Args {
         help = "Enable Bluetooth LE debug logging. Only use when absolutely necessary; this produces a lot of logs."
     )]
     le_debug: bool,
+    #[arg(long, help = "Don't show the tray icon (the window and everything else still run)")]
+    hide_tray_icon: bool,
     #[arg(long, short = 'v', help = "Show application version and exit")]
     version: bool
 }
 
 fn main() -> iced::Result {
+    // `librepods ctl …` talks to a running instance and exits.
+    let raw: Vec<String> = env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("ctl") {
+        std::process::exit(ipc::run_client(&raw[1..]));
+    }
+
     let args = Args::parse();
 
     if args.version {
@@ -135,7 +146,17 @@ async fn async_main(
     let (shutdown_tx, shutdown_rx) = unbounded_channel::<()>();
     spawn_shutdown_handler(device_managers.clone(), shutdown_rx);
 
-    let tray_handle = if args.no_tray {
+    if !args.no_tray {
+        hub::hub().set_ui_tx(ui_tx.clone());
+    }
+    tokio::spawn(ipc::serve());
+    tokio::spawn(notify::run());
+    spawn_popup();
+
+    let tray_handle = if args.no_tray
+        || args.hide_tray_icon
+        || crate::utils::AppSettings::load().hide_tray_icon
+    {
         None
     } else {
         let tray = MyTray {
@@ -179,19 +200,42 @@ async fn async_main(
              and not blocked - see `rfkill list bluetooth`."
         )
     })?;
-    adapter.set_powered(true).await.inspect_err(|e| {
-        log::error!(
-            "Cannot power on the Bluetooth adapter: {e}. It is likely soft-blocked, \
-             try `rfkill unblock bluetooth`."
-        )
-    })?;
+    // Respect a user who turned Bluetooth off (Mac-like); BlueZ's AutoEnable
+    // powers it at boot anyway.
+    let powered = adapter.is_powered().await.unwrap_or(false);
+    if !powered {
+        info!("Bluetooth is off; waiting for it to be turned on");
+    }
+    hub::hub().update("status", |s| s.bluetooth_on = powered);
+
 
     let le_tray_clone = tray_handle.clone();
     let le_ui_tx = ui_tx.clone();
+    // Supervise the LE monitor: restart it when it fails and whenever the
+    // adapter is powered back on (monitors don't survive a power cycle).
     tokio::spawn(async move {
-        info!("Starting LE monitor...");
-        if let Err(e) = start_le_monitor(le_tray_clone, le_ui_tx).await {
-            log::error!("LE monitor error: {}", e);
+        loop {
+            let mut rx = hub::hub().subscribe();
+            info!("Starting LE monitor...");
+            tokio::select! {
+                r = start_le_monitor(le_tray_clone.clone(), le_ui_tx.clone()) => {
+                    if let Err(e) = r {
+                        log::warn!("LE monitor stopped: {}", e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                _ = async {
+                    loop {
+                        match rx.recv().await {
+                            Ok(ev) if ev.event == "bluetooth_on" => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                std::future::pending::<()>().await
+                            }
+                            _ => {}
+                        }
+                    }
+                } => info!("Bluetooth powered on, restarting LE monitor"),
+            }
         }
     });
 
@@ -289,6 +333,25 @@ async fn async_main(
         let Some(path) = msg.path() else {
             return true;
         };
+        // Adapter power (Bluetooth on/off toggles anywhere in the system).
+        if path.starts_with("/org/bluez/hci") && !path.contains("/dev_") {
+            if let Ok((iface, changed, _)) =
+                msg.read3::<String, HashMap<String, Variant<Box<dyn RefArg>>>, Vec<String>>()
+                && iface == "org.bluez.Adapter1"
+                && let Some(p) = changed.get("Powered").and_then(|v| v.0.as_u64())
+            {
+                let on = p != 0;
+                info!("Bluetooth adapter powered {}", if on { "on" } else { "off" });
+                hub::hub().update(if on { "bluetooth_on" } else { "bluetooth_off" }, |s| {
+                    s.bluetooth_on = on;
+                    if !on {
+                        s.nearby = false;
+                        s.lid_open = None;
+                    }
+                });
+            }
+            return true;
+        }
         if !path.contains("/org/bluez/hci") || !path.contains("/dev_") {
             return true;
         }
@@ -320,6 +383,34 @@ async fn async_main(
             return true;
         };
         if is_connected==0 {
+            if hub::hub().snapshot().mac.as_deref() == Some(addr_str.as_str()) {
+                info!("AirPods {} disconnected", addr_str);
+                hub::hub().set_command_tx(None);
+                hub::hub().update("disconnected", |s| {
+                    s.connected = false;
+                    s.listening_mode = None;
+                    s.conversational_awareness = None;
+                    s.allow_off = None;
+                    s.headphone = None;
+                    s.in_ear = Default::default();
+                });
+                if let Some(handle) = tray_handle.clone() {
+                    tokio::spawn(async move {
+                        handle
+                            .update(|t: &mut MyTray| {
+                                t.connected = false;
+                                t.listening_mode = None;
+                                t.conversation_detect_enabled = None;
+                                t.command_tx = None;
+                                t.battery_headphone = None;
+                                t.battery_l = None;
+                                t.battery_r = None;
+                                t.battery_c = None;
+                            })
+                            .await;
+                    });
+                }
+            }
             if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceDisconnected(addr_str.clone())) {
                 warn!("Failed to send DeviceConnected UI message: {:?}", e);
             }
@@ -424,5 +515,40 @@ fn spawn_shutdown_handler(
             warn!("Shutdown cleanup timed out; exiting anyway");
         }
         std::process::exit(0);
+    });
+}
+
+/// Runs librepods-popup (the iOS-style case card) next to us and restarts it
+/// if it dies. Without it, notify.rs falls back to plain notifications.
+fn spawn_popup() {
+    let beside = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("librepods-popup")));
+    let in_path = env::var("PATH").ok().and_then(|p| {
+        p.split(':')
+            .map(|d| std::path::Path::new(d).join("librepods-popup"))
+            .find(|c| c.exists())
+    });
+    let Some(path) = beside.filter(|p| p.exists()).or(in_path) else {
+        info!("librepods-popup not found; using plain notifications");
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            match tokio::process::Command::new(&path).kill_on_drop(true).spawn() {
+                Ok(mut child) => {
+                    info!("Started {}", path.display());
+                    notify::POPUP_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let status = child.wait().await;
+                    notify::POPUP_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    warn!("librepods-popup exited ({:?}), restarting in 5 s", status);
+                }
+                Err(e) => {
+                    warn!("Cannot start {}: {}", path.display(), e);
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
     });
 }

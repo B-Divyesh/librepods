@@ -224,6 +224,23 @@ pub struct AppSettings {
     pub hires_mic_pause_convo: bool,
     pub a2dp_reset: bool,
     pub preferred_codec: PreferredCodec,
+    /// iOS-style card when the case lid opens nearby.
+    pub case_popup: bool,
+    /// Short card when the AirPods connect (macOS HUD).
+    pub connect_popup: bool,
+    /// Connect by themselves when the case opens instead of offering a button.
+    pub auto_connect_on_open: bool,
+    pub low_battery_alerts: bool,
+    /// Toast when the listening mode or conversation awareness changes.
+    pub mode_toasts: bool,
+    /// "Automatic switching": take the AirPods over when media starts here.
+    pub media_takeover: bool,
+    /// Pause when a bud comes out, resume when it goes back in.
+    pub ear_pause: bool,
+    /// Route audio to the speakers while the AirPods are out of your ears.
+    pub switch_output_when_removed: bool,
+    /// Hide the StatusNotifier tray icon (e.g. when the Waybar module is used).
+    pub hide_tray_icon: bool,
 }
 
 impl Default for AppSettings {
@@ -232,11 +249,20 @@ impl Default for AppSettings {
             theme: MyTheme::Dark,
             tray_text_mode: false,
             stem_control: false,
-            hires_mic_enabled: true,
+            hires_mic_enabled: false,
             hires_mic_agc: true,
             hires_mic_pause_convo: true,
             a2dp_reset: true,
             preferred_codec: PreferredCodec::default(),
+            case_popup: true,
+            connect_popup: true,
+            auto_connect_on_open: false,
+            low_battery_alerts: true,
+            mode_toasts: true,
+            media_takeover: true,
+            ear_pause: true,
+            switch_output_when_removed: true,
+            hide_tray_icon: false,
         }
     }
 }

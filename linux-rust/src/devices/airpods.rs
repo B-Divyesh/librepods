@@ -1,4 +1,7 @@
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
+use crate::bluetooth::aacp::{BatteryStatus, EarDetectionStatus};
+use crate::hub::{Battery, ListeningMode, hub};
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::media_controller::MediaController;
 use crate::ui::messages::BluetoothUIMessage;
@@ -29,6 +32,36 @@ impl AirPodsDevice {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
         aacp_manager.connect(mac_address).await;
+
+        // Tell the hub (CLI, Waybar, popup). The "connected" event itself waits
+        // for the first battery report (or 1.5 s) so cards show real levels.
+        let control_up = aacp_manager.state.lock().await.sender.is_some();
+        let stored_name = aacp_manager
+            .state
+            .lock()
+            .await
+            .devices
+            .get(&mac_address.to_string())
+            .map(|d| d.name.clone())
+            .filter(|n| !n.is_empty() && *n != mac_address.to_string());
+        hub().update("status", |s| {
+            s.connected = control_up;
+            s.mac = Some(mac_address.to_string());
+            s.other_host = false;
+            if let Some(n) = &stored_name {
+                s.name = Some(n.clone());
+            }
+        });
+        let announced = Arc::new(AtomicBool::new(!control_up));
+        {
+            let announced = announced.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(1500)).await;
+                if !announced.swap(true, Ordering::SeqCst) {
+                    hub().emit("connected");
+                }
+            });
+        }
 
         // let mut att_manager = ATTManager::new();
         // att_manager.connect(mac_address).await.expect("Failed to connect ATT");
@@ -125,6 +158,7 @@ impl AirPodsDevice {
         let mc_clone = media_controller.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        hub().set_command_tx(Some(command_tx.clone()));
 
         aacp_manager.set_event_channel(tx).await;
         if let Some(handle) = &tray_handle {
@@ -171,6 +205,10 @@ impl AirPodsDevice {
         let tray_handle_clone = tray_handle.clone();
         tokio::spawn(async move {
             while let Some(value) = listening_mode_rx.recv().await {
+                let mode = ListeningMode::from_byte(value[0]);
+                let prev = hub().snapshot().listening_mode;
+                let ev = if prev.is_some() && prev != mode { "mode" } else { "status" };
+                hub().update(ev, |s| s.listening_mode = mode);
                 if let Some(handle) = &tray_handle_clone {
                     handle
                         .update(|tray: &mut MyTray| {
@@ -188,6 +226,7 @@ impl AirPodsDevice {
         let tray_handle_clone = tray_handle.clone();
         tokio::spawn(async move {
             while let Some(value) = allow_off_rx.recv().await {
+                hub().update("status", |s| s.allow_off = Some(value[0] == 0x01));
                 if let Some(handle) = &tray_handle_clone {
                     handle
                         .update(|tray: &mut MyTray| {
@@ -209,6 +248,10 @@ impl AirPodsDevice {
         let tray_handle_clone = tray_handle.clone();
         tokio::spawn(async move {
             while let Some(value) = conversation_detect_rx.recv().await {
+                let on = Some(value[0] == 0x01);
+                let prev = hub().snapshot().conversational_awareness;
+                let ev = if prev.is_some() && prev != on { "ca" } else { "status" };
+                hub().update(ev, |s| s.conversational_awareness = on);
                 if let Some(handle) = &tray_handle_clone {
                     handle
                         .update(|tray: &mut MyTray| {
@@ -240,6 +283,7 @@ impl AirPodsDevice {
         });
 
         let aacp_manager_clone_events = aacp_manager.clone();
+        let announced_ev = announced.clone();
         let local_mac_events = local_mac.clone();
         let ui_tx_clone = ui_tx.clone();
         let command_tx_clone = command_tx.clone();
@@ -252,7 +296,22 @@ impl AirPodsDevice {
                             "Received EarDetection event: old_status={:?}, new_status={:?}",
                             old_status, new_status
                         );
-                        let controller = mc_clone.lock().await;
+                        // AACP reports [primary, secondary]; BLE tells which side leads.
+                        let primary_left = hub().snapshot().primary_left.unwrap_or(true);
+                        let ear = |i: usize| {
+                            new_status.get(i).map(|st| *st == EarDetectionStatus::InEar)
+                        };
+                        let case = |i: usize| {
+                            new_status.get(i).map(|st| *st == EarDetectionStatus::InCase)
+                        };
+                        let (pi, si) = if primary_left { (0, 1) } else { (1, 0) };
+                        hub().update("status", |s| {
+                            s.in_ear.left = ear(pi);
+                            s.in_ear.right = ear(si);
+                            s.in_case.left = case(pi);
+                            s.in_case.right = case(si);
+                        });
+                        let controller = mc_clone.lock().await.clone();
                         debug!(
                             "Calling handle_ear_detection with old_status: {:?}, new_status: {:?}",
                             old_status, new_status
@@ -263,6 +322,26 @@ impl AirPodsDevice {
                     }
                     AACPEvent::BatteryInfo(battery_info) => {
                         debug!("Received BatteryInfo event: {:?}", battery_info);
+                        hub().update("status", |s| {
+                            for b in &battery_info {
+                                let v = (b.status != BatteryStatus::Disconnected).then_some(Battery {
+                                    level: b.level,
+                                    charging: b.status == BatteryStatus::Charging,
+                                });
+                                match b.component as u8 {
+                                    0x01 => s.headphone = v,
+                                    0x02 => s.right = v,
+                                    0x04 => s.left = v,
+                                    // Out of the case the buds report it as
+                                    // disconnected; keep the BLE reading then.
+                                    0x08 => s.case = v.or(s.case),
+                                    _ => {}
+                                }
+                            }
+                        });
+                        if !announced_ev.swap(true, Ordering::SeqCst) {
+                            hub().emit("connected");
+                        }
                         if let Some(handle) = &tray_handle {
                             handle
                                 .update(|tray: &mut MyTray| {

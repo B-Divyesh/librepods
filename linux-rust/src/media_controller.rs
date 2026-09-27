@@ -154,7 +154,7 @@ impl MediaController {
                     info!("Media playback started but buds not in ear, skipping takeover");
                     continue;
                 }
-                if !crate::utils::app_setting("media_takeover", true) {
+                if !crate::utils::AppSettings::load().media_takeover {
                     debug!("Automatic switching disabled, not taking over");
                     continue;
                 }
@@ -239,8 +239,12 @@ impl MediaController {
             in_ear, old_all_out, new_has_at_least_one_in, new_all_out
         );
 
+        let settings = crate::utils::AppSettings::load();
+        let ear_pause = settings.ear_pause;
         {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
+            state.ear_detection_enabled = settings.ear_pause || settings.switch_output_when_removed;
+            state.disconnect_when_not_wearing = settings.switch_output_when_removed;
             if !state.ear_detection_enabled {
                 debug!("Ear detection disabled, skipping");
                 return;
@@ -259,7 +263,7 @@ impl MediaController {
             }
         } else if new_all_out {
             debug!("Condition met: buds removed, pausing media");
-            self.pause().await;
+            if ear_pause { self.pause().await; }
             {
                 let state = self.state.lock().await;
                 if state.disconnect_when_not_wearing {
@@ -292,15 +296,15 @@ impl MediaController {
             debug!("Ear data changed, checking resume/pause logic");
             if in_ear {
                 debug!("Resuming media as buds are in ear");
-                self.resume().await;
+                if ear_pause { self.resume().await; }
                 self.state.lock().await.i_paused_the_media = false;
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
-                self.pause().await;
+                if ear_pause { self.pause().await; }
                 self.state.lock().await.i_paused_the_media = true;
             } else {
                 debug!("Playing media");
-                self.resume().await;
+                if ear_pause { self.resume().await; }
                 self.state.lock().await.i_paused_the_media = false;
             }
         }

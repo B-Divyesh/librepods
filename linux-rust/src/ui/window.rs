@@ -88,6 +88,7 @@ pub struct App {
     hires_mic_agc: bool,
     hires_mic_pause_convo: bool,
     a2dp_reset: bool,
+    macfeel: AppSettings,
 }
 
 pub struct BluetoothState {
@@ -125,6 +126,23 @@ pub enum Message {
     HiResMicAgcChanged(bool),
     HiResMicPauseConvoChanged(bool),
     MicLevelTick,
+    RenameDevice(String, String),
+    MacFeel(MacFeelSetting),
+}
+
+/// Toggles in the "Mac experience" settings section.
+#[derive(Debug, Clone, Copy)]
+pub enum MacFeelSetting {
+    CasePopup(bool),
+    ConnectPopup(bool),
+    AutoConnectOnOpen(bool),
+    LowBatteryAlerts(bool),
+    ModeToasts(bool),
+    MediaTakeover(bool),
+    EarPause(bool),
+    SwitchOutput(bool),
+    HideTrayIcon(bool),
+    Bluetooth(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -157,6 +175,7 @@ impl App {
             (None, Task::none())
         } else {
             let mut settings = window::Settings::default();
+            settings.platform_specific.application_id = "me.kavishdevar.librepods".to_string();
             settings.min_size = Some(Size::new(400.0, 300.0));
             settings.icon = window::icon::from_file("../../assets/icon.png").ok();
             let (id, open) = window::open(settings);
@@ -228,6 +247,7 @@ impl App {
                 hires_mic_agc,
                 hires_mic_pause_convo,
                 a2dp_reset,
+                macfeel: app_settings.clone(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -243,6 +263,7 @@ impl App {
             hires_mic_pause_convo: self.hires_mic_pause_convo,
             a2dp_reset: self.a2dp_reset,
             preferred_codec: self.preferred_codec,
+            ..self.macfeel.clone()
         }
         .save();
     }
@@ -293,6 +314,7 @@ impl App {
                             Task::batch(vec![window::gain_focus(window_id), wait_task])
                         } else {
                             let mut settings = window::Settings::default();
+            settings.platform_specific.application_id = "me.kavishdevar.librepods".to_string();
                             settings.min_size = Some(Size::new(400.0, 300.0));
                             settings.icon = window::icon::from_file("../../assets/icon.png").ok();
                             let (new_window_task, open_task) = window::open(settings);
@@ -398,6 +420,11 @@ impl App {
                                         matches!(status.value.as_slice(), [0x01])
                                     }),
                                     hires_mic_enabled: self.hires_mic_enabled,
+                                    controls: state
+                                        .control_command_status_list
+                                        .iter()
+                                        .map(|s| (s.identifier as u8, s.value.clone()))
+                                        .collect(),
                                 }));
                             }
                             Some(DeviceType::Nothing) => {
@@ -444,7 +471,11 @@ impl App {
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
                         debug!("AACP UI Event for {}: {:?}", mac, event);
                         match event {
-                            AACPEvent::ControlCommand(status) => match status.identifier {
+                            AACPEvent::ControlCommand(status) => {
+                                if let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac) {
+                                    state.controls.insert(status.identifier as u8, status.value.clone());
+                                }
+                                match status.identifier {
                                 ControlCommandIdentifiers::ListeningMode => {
                                     let mode = status
                                         .value
@@ -525,7 +556,7 @@ impl App {
                                 _ => {
                                     debug!("Unhandled Control Command Status: {:?}", status);
                                 }
-                            },
+                            }},
                             AACPEvent::BatteryInfo(battery_info) => {
                                 if let Some(DeviceState::AirPods(state)) =
                                     self.device_states.get_mut(&mac)
@@ -654,6 +685,59 @@ impl App {
             }
             Message::PreferredCodecChanged(codec) => {
                 self.preferred_codec = codec;
+                self.save_settings();
+                // Apply now instead of on the next reconnect.
+                for mac in self.bluetooth_state.connected_devices.clone() {
+                    std::thread::spawn(move || {
+                        if let Some(p) = crate::media_controller::apply_preferred_codec_sync(&mac) {
+                            log::info!("Switched {} to {}", mac, p);
+                        }
+                    });
+                }
+                Task::none()
+            }
+            Message::RenameDevice(mac, name) => {
+                let name = name.trim().to_string();
+                if !name.is_empty()
+                    && let Ok(managers) = self.device_managers.try_read()
+                    && let Some(aacp) = managers.get(&mac).and_then(|m| m.get_aacp())
+                {
+                    let a = aacp.clone();
+                    aacp.runtime().spawn(async move {
+                        if let Err(e) = a.send_rename_packet(&name).await {
+                            error!("Rename failed: {}", e);
+                        }
+                    });
+                }
+                Task::none()
+            }
+            Message::MacFeel(setting) => {
+                let m = &mut self.macfeel;
+                match setting {
+                    MacFeelSetting::CasePopup(v) => m.case_popup = v,
+                    MacFeelSetting::ConnectPopup(v) => m.connect_popup = v,
+                    MacFeelSetting::AutoConnectOnOpen(v) => m.auto_connect_on_open = v,
+                    MacFeelSetting::LowBatteryAlerts(v) => m.low_battery_alerts = v,
+                    MacFeelSetting::ModeToasts(v) => m.mode_toasts = v,
+                    MacFeelSetting::MediaTakeover(v) => m.media_takeover = v,
+                    MacFeelSetting::EarPause(v) => m.ear_pause = v,
+                    MacFeelSetting::SwitchOutput(v) => m.switch_output_when_removed = v,
+                    MacFeelSetting::HideTrayIcon(v) => m.hide_tray_icon = v,
+                    MacFeelSetting::Bluetooth(on) => {
+                        crate::hub::hub().update("status", |s| s.bluetooth_on = on);
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build();
+                            if let Ok(rt) = rt
+                                && let Err(e) = rt.block_on(crate::ipc::set_bluetooth(on))
+                            {
+                                error!("Bluetooth power change failed: {}", e);
+                            }
+                        });
+                        return Task::none();
+                    }
+                }
                 self.save_settings();
                 Task::none()
             }
@@ -1326,6 +1410,8 @@ impl App {
                                     Space::new().height(Length::from(20)),
                                     tray_text_mode_toggle,
                                     Space::new().height(Length::from(20)),
+                                    macfeel_section(&self.macfeel),
+                                    Space::new().height(Length::from(20)),
                                     controls_settings_col,
                                     Space::new().height(Length::from(20)),
                                     audio_settings_col,
@@ -1515,14 +1601,23 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let close = window::close_events().map(Message::WindowClosed);
 
-        // Only tick while a hi-res mic is capturing.
-        let mic_active = self
-            .device_states
-            .values()
-            .any(|s| matches!(s, DeviceState::AirPods(a) if a.hires_mic_enabled));
+        // Redraw the mic meter at 20 Hz only while a hi-res mic is actually
+        // capturing and a window is open; otherwise poll lazily (1 Hz) so a
+        // capture that starts is noticed, or not at all.
+        let enabled = self.window.is_some()
+            && self
+                .device_states
+                .values()
+                .any(|s| matches!(s, DeviceState::AirPods(a) if a.hires_mic_enabled));
+        let capturing = enabled
+            && self.device_managers.try_read().is_ok_and(|m| {
+                m.values()
+                    .any(|d| d.get_aacp().is_some_and(|a| a.mic_active()))
+            });
 
-        if mic_active {
-            let tick = iced::time::every(std::time::Duration::from_millis(50))
+        if enabled {
+            let period = if capturing { 50 } else { 1000 };
+            let tick = iced::time::every(std::time::Duration::from_millis(period))
                 .map(|_| Message::MicLevelTick);
             Subscription::batch([close, tick])
         } else {
@@ -1564,3 +1659,123 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
 //
 //     devices
 // }
+
+fn macfeel_toggle<'a>(
+    title: &'a str,
+    subtitle: &'a str,
+    value: bool,
+    msg: fn(bool) -> MacFeelSetting,
+) -> Element<'a, Message> {
+    container(
+        row![
+            column![
+                text(title).size(16),
+                text(subtitle).size(12).style(|theme: &Theme| {
+                    let mut style = text::Style::default();
+                    style.color = Some(theme.palette().text.scale_alpha(0.7));
+                    style
+                })
+            ]
+            .width(Length::Fill),
+            toggler(value)
+                .on_toggle(move |v| Message::MacFeel(msg(v)))
+                .size(20)
+        ]
+        .align_y(Center)
+        .spacing(12),
+    )
+    .padding(Padding {
+        top: 5.0,
+        bottom: 5.0,
+        left: 18.0,
+        right: 18.0,
+    })
+    .style(|theme: &Theme| {
+        let mut style = container::Style::default();
+        style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+        let mut border = Border::default();
+        border.color = theme.palette().primary.scale_alpha(0.5);
+        style.border = border.rounded(16);
+        style
+    })
+    .into()
+}
+
+/// Settings that make the AirPods behave like they do with a Mac.
+fn macfeel_section(s: &AppSettings) -> Element<'_, Message> {
+    column![
+        container(text("Mac Experience").size(20).style(|theme: &Theme| {
+            let mut style = text::Style::default();
+            style.color = Some(theme.palette().primary);
+            style
+        }))
+        .padding(Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: 18.0,
+            right: 18.0,
+        }),
+        macfeel_toggle(
+            "Bluetooth",
+            "Turn the Bluetooth adapter on or off.",
+            crate::hub::hub().snapshot().bluetooth_on,
+            MacFeelSetting::Bluetooth,
+        ),
+        macfeel_toggle(
+            "Case-open card",
+            "Show the battery card with a Connect button when you open the case nearby.",
+            s.case_popup,
+            MacFeelSetting::CasePopup,
+        ),
+        macfeel_toggle(
+            "Connect automatically when the case opens",
+            "Take the AirPods as soon as the lid opens, unless they are busy on another device.",
+            s.auto_connect_on_open,
+            MacFeelSetting::AutoConnectOnOpen,
+        ),
+        macfeel_toggle(
+            "Connected card",
+            "Briefly show the battery card whenever the AirPods connect.",
+            s.connect_popup,
+            MacFeelSetting::ConnectPopup,
+        ),
+        macfeel_toggle(
+            "Automatic switching",
+            "When media starts playing here, move the AirPods over from your phone.",
+            s.media_takeover,
+            MacFeelSetting::MediaTakeover,
+        ),
+        macfeel_toggle(
+            "Pause when removed",
+            "Pause media when you take an AirPod out, resume when you put it back.",
+            s.ear_pause,
+            MacFeelSetting::EarPause,
+        ),
+        macfeel_toggle(
+            "Use speakers when not wearing",
+            "Switch output back to the laptop while the AirPods are out of your ears.",
+            s.switch_output_when_removed,
+            MacFeelSetting::SwitchOutput,
+        ),
+        macfeel_toggle(
+            "Low battery alerts",
+            "Notify at 20 % and 10 %, like iPhone and Mac.",
+            s.low_battery_alerts,
+            MacFeelSetting::LowBatteryAlerts,
+        ),
+        macfeel_toggle(
+            "Listening mode toasts",
+            "Small on-screen hint when the mode or Conversation Awareness changes.",
+            s.mode_toasts,
+            MacFeelSetting::ModeToasts,
+        ),
+        macfeel_toggle(
+            "Hide tray icon",
+            "Use the Waybar AirPods module instead (takes effect on restart).",
+            s.hide_tray_icon,
+            MacFeelSetting::HideTrayIcon,
+        ),
+    ]
+    .spacing(12)
+    .into()
+}

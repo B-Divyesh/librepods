@@ -60,6 +60,8 @@ pub struct AirPodsState {
     /// Local capture state of the proprietary hi-res microphone (UI-driven).
     pub hires_mic_enabled: bool,
     pub battery: Vec<BatteryInfo>,
+    /// Raw control-command values by identifier, as last reported by the buds.
+    pub controls: std::collections::HashMap<u8, Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]

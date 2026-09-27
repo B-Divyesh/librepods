@@ -28,7 +28,6 @@ pub fn airpods_view<'a>(
     let mac = mac.to_string();
     // order: name, noise control, press and hold config, call controls (not sure if why it might be needed, adding it just in case), audio (personalized volume, conversational awareness, adaptive audio slider), connection settings, microphone, head gestures (not adding this), off listening mode, device information
 
-    let aacp_manager_for_rename = aacp_manager.clone();
     let rename_input = container(
         row![
             Space::new().width(10),
@@ -56,25 +55,17 @@ pub fn airpods_view<'a>(
                     }
                 })
                 .align_x(End)
+                // Rename on Enter, not on every keystroke (each packet renames the buds).
                 .on_input({
                     let mac = mac.clone();
                     let state = state.clone();
                     move |new_name| {
-                        let aacp_manager = aacp_manager_for_rename.clone();
-                        run_async_in_thread({
-                            let new_name = new_name.clone();
-                            async move {
-                                aacp_manager
-                                    .send_rename_packet(&new_name)
-                                    .await
-                                    .expect("Failed to send rename packet");
-                            }
-                        });
                         let mut state = state.clone();
                         state.device_name = new_name.clone();
                         Message::StateChanged(mac.to_string(), DeviceState::AirPods(state))
                     }
                 })
+                .on_submit(Message::RenameDevice(mac.clone(), state.device_name.clone()))
         ]
         .align_y(Center),
     )
@@ -121,7 +112,7 @@ pub fn airpods_view<'a>(
                                         &[selected_mode_c.to_byte()],
                                     )
                                     .await
-                                    .expect("Failed to send Noise Control Mode command");
+                                    .map_err(|e| error!("Failed to send Noise Control Mode command: {}", e)).ok();
                             });
                             let mut state = state_clone.clone();
                             state.noise_control_mode = selected_mode.clone();
@@ -229,7 +220,7 @@ pub fn airpods_view<'a>(
                                             aacp_manager.send_control_command(
                                                 ControlCommandIdentifiers::AdaptiveVolumeConfig,
                                                 if is_enabled { &[0x01] } else { &[0x02] }
-                                            ).await.expect("Failed to send Personalized Volume command");
+                                            ).await.map_err(|e| error!("Failed to send Personalized Volume command: {}", e)).ok();
                                         }
                                     );
                                     let mut state = state.clone();
@@ -336,7 +327,7 @@ pub fn airpods_view<'a>(
                             aacp_manager.send_control_command(
                                 ControlCommandIdentifiers::AllowOffOption,
                                 if is_enabled { &[0x01] } else { &[0x02] }
-                            ).await.expect("Failed to send Off Listening Mode command");
+                            ).await.map_err(|e| error!("Failed to send Off Listening Mode command: {}", e)).ok();
                         }
                     );
                     let mut state = state.clone();
@@ -570,6 +561,7 @@ pub fn airpods_view<'a>(
         }
     }
 
+    let extra = crate::ui::airpods_extra::extra_settings(&mac, state, aacp_manager.clone());
     container(column![
         rename_input,
         Space::new().height(Length::from(20)),
@@ -578,6 +570,8 @@ pub fn airpods_view<'a>(
         audio_settings_col,
         Space::new().height(Length::from(20)),
         off_listening_mode_toggle,
+        Space::new().height(Length::from(20)),
+        extra,
         Space::new().height(Length::from(20)),
         hires_mic_toggle,
         Space::new().height(Length::from(20)),

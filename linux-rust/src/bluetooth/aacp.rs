@@ -886,7 +886,13 @@ impl AACPManager {
                     && let Some(device_data) = state.devices.get_mut(&mac.to_string())
                 {
                     device_data.name = info.name.clone();
-                    device_data.information = Some(DeviceInformation::AirPods(info.clone()));
+                    // Keep the BLE keys from an earlier session; they only
+                    // arrive after this packet.
+                    let mut info = info.clone();
+                    if let Some(DeviceInformation::AirPods(old)) = &device_data.information {
+                        info.le_keys = old.le_keys.clone();
+                    }
+                    device_data.information = Some(DeviceInformation::AirPods(info));
                 }
                 let json = serde_json::to_string(&state.devices).unwrap();
                 if let Some(parent) = get_devices_path().parent()

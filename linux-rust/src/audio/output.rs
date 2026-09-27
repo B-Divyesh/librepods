@@ -85,7 +85,16 @@ impl Output {
         // O_RDWR never blocks on a FIFO and keeps the pipe from ever seeing
         // "all writers closed"; we only ever write to it.
         let path = fifo_path();
-        let fifo = match OpenOptions::new().read(true).write(true).open(&path) {
+        // O_NONBLOCK: if nothing drains the pipe (pipewire-pulse restarted
+        // mid-capture) frames are dropped instead of wedging the decoder.
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0o4000;
+        let fifo = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) => {
                 error!("could not open hi-res fifo {}: {}", path, e);
@@ -123,10 +132,15 @@ impl Output {
             std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
         };
 
-        self.fifo
-            .write_all(bytes)
-            .map(|_| peak)
-            .map_err(|e| error!("hi-res fifo write broke: {}", e))
+        // Each frame is < PIPE_BUF, so the write is atomic: all or EAGAIN.
+        match self.fifo.write(bytes) {
+            Ok(_) => Ok(peak),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(peak),
+            Err(e) => {
+                error!("hi-res fifo write broke: {}", e);
+                Err(())
+            }
+        }
     }
 }
 
@@ -145,7 +159,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
         }
     });
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
 
     let app = Rc::new(RefCell::new(None::<String>));
@@ -155,7 +169,15 @@ pub fn source_consumer(name: &str) -> Option<String> {
             let app = app.clone();
             move |result| {
                 if let ListResult::Item(item) = result {
-                    if item.source == idx && app.borrow().is_none() {
+                    // Level meters (pavucontrol & co.) attach peak-detect
+                    // streams; they are not someone talking.
+                    let media = item.proplist.get_str("media.name").unwrap_or_default();
+                    let is_meter = media.contains("Peak detect")
+                        || item
+                            .proplist
+                            .get_str("application.id")
+                            .is_some_and(|a| a.contains("pavucontrol"));
+                    if item.source == idx && !is_meter && app.borrow().is_none() {
                         let label = item
                             .proplist
                             .get_str("application.name")
@@ -166,7 +188,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
             }
         });
         while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
+            mainloop.iterate(true);
         }
     }
     mainloop.quit(Retval(0));
@@ -202,7 +224,7 @@ pub fn reset_a2dp(bdaddr: &str) {
         }
     });
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
 
     let Some(current_profile) = current_profile.borrow().clone() else {
@@ -221,12 +243,12 @@ pub fn reset_a2dp(bdaddr: &str) {
     );
     let op = introspect.set_card_profile_by_name(&card, "off", None);
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
 
     let op = introspect.set_card_profile_by_name(&card, &current_profile, None);
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
     mainloop.quit(Retval(0));
 
@@ -290,7 +312,7 @@ fn connect() -> Option<(Mainloop, Context)> {
         .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
         .ok()?;
     loop {
-        match mainloop.iterate(false) {
+        match mainloop.iterate(true) {
             IterateResult::Quit(_) | IterateResult::Err(_) => return None,
             IterateResult::Success(_) => {}
         }
@@ -323,7 +345,7 @@ fn unload_stale_modules() {
         }
     });
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
     mainloop.quit(Retval(0));
 
@@ -342,7 +364,7 @@ fn load_module(name: &str, args: &str) -> Option<u32> {
         move |index| idx.set(index)
     });
     while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+        mainloop.iterate(true);
     }
     mainloop.quit(Retval(0));
 
@@ -360,7 +382,7 @@ fn unload_module(index: u32) {
         let mut introspect = context.introspect();
         let op = introspect.unload_module(index, |_| {});
         while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
+            mainloop.iterate(true);
         }
         mainloop.quit(Retval(0));
     }
