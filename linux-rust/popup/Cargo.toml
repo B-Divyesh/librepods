@@ -1,0 +1,33 @@
+[package]
+name = "librepods-popup"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Apple-style \"AirPods case opened\" card for LibrePods, drawn as a wlr-layer-shell overlay"
+publish = false
+
+# Stand-alone package: do not join the parent linux-rust workspace.
+[workspace]
+
+[dependencies]
+# Wayland: raw wl_shm buffers on a wlr-layer-shell surface (no toolkit).
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# CPU rasteriser for the card, shaping + exact-coverage glyph rasteriser
+# for the text.
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }
+rustybuzz = "0.20"
+ab_glyph_rasterizer = "0.1"
+# JSON event stream from the LibrePods daemon.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
