@@ -425,7 +425,11 @@ impl Wl {
         layer.set_size(0, 0);
         // -1: cover the whole output, bar included.
         layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        // No keyboard grab: taking focus (exclusive, or on-demand under
+        // Hyprland's follow-mouse) moves it off the window and back on close,
+        // so the bar's window title flickered on every click. Click outside
+        // or on the bar icon again to close.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         let bg_viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&bg, qh, ()));
         let frac = match (&self.frac_mgr, &bg_viewport) {
             (Some(m), Some(_)) => Some(m.get_fractional_scale(&bg, qh, Target::Menu)),
