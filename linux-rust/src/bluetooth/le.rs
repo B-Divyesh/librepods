@@ -403,6 +403,7 @@ async fn handle_frame(
         s.primary_left = Some(adv.primary_left);
         s.model = Some(model_name(adv.model).to_string());
         s.other_host = !s.connected && adv.conn_state != 0;
+        s.other_state = adv.conn_state;
         s.lid_open = adv.lid_closed.map(|c| !c);
         s.in_case.left = Some((adv.both_in_case || (adv.this_in_case && adv.primary_left)) && !adv.in_ear_left);
         s.in_case.right = Some((adv.both_in_case || (adv.this_in_case && !adv.primary_left)) && !adv.in_ear_right);
@@ -443,7 +444,11 @@ async fn maybe_auto_connect(
     connected: bool,
     rt: &Arc<Mutex<HashMap<String, DeviceRuntime>>>,
 ) {
-    if connected || adv.conn_state != 0 || !AppSettings::load().auto_connect_on_open {
+    if connected
+        || adv.conn_state != 0
+        || crate::repair::running()
+        || !AppSettings::load().auto_connect_on_open
+    {
         return;
     }
     {
@@ -465,7 +470,9 @@ async fn maybe_auto_connect(
     let res = crate::ipc::bluetoothctl("connect", &m.mac).await;
     if let Err(e) = &res {
         info!("Auto-connect to {} failed: {}", m.mac, e);
-        hub().emit("connect_failed");
+        if !crate::repair::running() {
+            hub().emit("connect_failed");
+        }
     }
     if let Some(d) = rt.lock().await.get_mut(&m.mac) {
         d.connecting = false;

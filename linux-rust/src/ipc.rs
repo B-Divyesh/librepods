@@ -22,6 +22,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
 pub fn socket_path() -> PathBuf {
+    // Test harness / second instance: tests/sim runs a daemon on its own socket.
+    if let Some(p) = std::env::var_os("LIBREPODS_SOCKET") {
+        return PathBuf::from(p);
+    }
     let dir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc_getuid() }));
     PathBuf::from(dir).join("librepods.sock")
@@ -178,6 +182,13 @@ async fn run(cmd: &str, arg: &str) -> String {
                 "toggle" => "connect",
                 c => c,
             };
+            if action == "connect" && crate::repair::running() {
+                return err("pairing again — hold the button on the back of the case until the light flashes white");
+            }
+            if action == "connect" && st.repair == Some(crate::hub::RepairState::Failed) {
+                crate::repair::start(mac, "retry");
+                return ok();
+            }
             if action == "connect" {
                 hub().emit("connecting");
             }
@@ -190,7 +201,8 @@ async fn run(cmd: &str, arg: &str) -> String {
                     ok()
                 }
                 Err(e) => {
-                    if action == "connect" {
+                    // A lost pairing is taken over by repair.rs (card + notification).
+                    if action == "connect" && !crate::repair::running() {
                         hub().emit("connect_failed");
                     }
                     err(e)
@@ -228,13 +240,40 @@ async fn run(cmd: &str, arg: &str) -> String {
                 }
             }
         }
+        "repair" | "pair" => {
+            if arg == "cancel" {
+                return if crate::repair::cancel() { ok() } else { err("not pairing") };
+            }
+            let mac = match st.mac.clone().or_else(default_airpods_mac) {
+                Some(m) => Some(m),
+                None => paired_airpods().await,
+            };
+            match mac {
+                _ if crate::repair::running() => ok(),
+                Some(mac) => {
+                    crate::repair::start(mac, "requested");
+                    json!({"ok": true, "repair": "waiting",
+                           "hint": "hold the button on the back of the case until the light flashes white"})
+                    .to_string()
+                }
+                None => err("no AirPods known yet — pair them once in your Bluetooth settings"),
+            }
+        }
         "help" | "" => json!({"commands": [
             "status", "watch", "mode off|anc|transparency|adaptive|next", "ca on|off|toggle",
             "bluetooth on|off|toggle",
-            "connect", "disconnect", "toggle", "bluetooth on|off|toggle", "open", "popup", "menu [x]"]})
+            "connect", "disconnect", "toggle", "repair [cancel]", "open", "popup", "menu [x]"]})
         .to_string(),
         other => err(format!("unknown command '{other}'")),
     }
+}
+
+/// AirPods we have talked to before (they are in devices.json).
+fn is_known_airpods(mac: &str) -> bool {
+    std::fs::read_to_string(crate::utils::get_devices_path())
+        .ok()
+        .and_then(|j| serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&j).ok())
+        .is_some_and(|m| m.keys().any(|k| k.eq_ignore_ascii_case(mac)))
 }
 
 /// First AirPods in devices.json — used when we have not seen them this session.
@@ -298,6 +337,17 @@ pub async fn bluetoothctl(action: &str, mac: &str) -> Result<(), String> {
     if out.status.success() && !text.contains("Failed") {
         Ok(())
     } else {
+        // "not available": BlueZ has no record of them any more (a recovery
+        // that timed out already dropped the stale bond) — same cure.
+        if action == "connect"
+            && (crate::repair::is_key_missing(&text)
+                || (text.contains("not available") && is_known_airpods(mac)))
+        {
+            crate::repair::start(mac.to_string(), "they no longer have the pairing key");
+            return Err("the AirPods forgot this computer — hold the button on the back of the case \
+                        until the light flashes white to pair again"
+                .to_string());
+        }
         Err(text
             .lines()
             .rev()
@@ -454,6 +504,29 @@ fn waybar_json(v: &serde_json::Value) -> String {
     if !st.bluetooth_on {
         // The Bluetooth module already shows "off"; stay out of the way.
         return json!({"text": "", "tooltip": "", "class": ["bt-off"]}).to_string();
+    }
+    if let Some(r) = st.repair.as_deref() {
+        let name = st.name.clone().unwrap_or_else(|| "AirPods".into());
+        let (state, hint) = match r {
+            "pairing" => ("Pairing…", "Keep the case open next to the computer."),
+            "failed" => (
+                "Couldn't pair",
+                "Hold the button on the back of the case until the light flashes white,\nthen middle-click to try again.",
+            ),
+            _ => (
+                "Needs pairing again",
+                "Hold the button on the back of the case until the light flashes white.\nPairing happens by itself.",
+            ),
+        };
+        return json!({
+            "text": G_EARBUDS_OUTLINE,
+            "tooltip": format!(
+                "<b>{}</b>  ·  {state}\n\n{hint}\n\n<span alpha='60%'>They forgot this computer (a reset, another device or\nthe other OS of a dual boot paired them).</span>",
+                glib_escape(&name)
+            ),
+            "class": ["repair", r],
+        })
+        .to_string();
     }
     let (glyph, text) = if st.connected {
         classes.push("connected");
@@ -626,6 +699,7 @@ struct WireStatus {
     lid_open: Option<bool>,
     listening_mode: Option<String>,
     conversational_awareness: Option<bool>,
+    repair: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

@@ -5,6 +5,8 @@ mod hub;
 mod ipc;
 mod media_controller;
 mod notify;
+mod repair;
+mod handoff;
 mod ui;
 mod utils;
 
@@ -124,6 +126,7 @@ async fn async_main(
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
 ) -> bluer::Result<()> {
     let args = Args::parse();
+    repair::set_runtime(tokio::runtime::Handle::current());
 
     let mut managed_devices_mac: Vec<String> = Vec::new(); // includes ony non-AirPods. AirPods handled separately.
 
@@ -151,6 +154,7 @@ async fn async_main(
     }
     tokio::spawn(ipc::serve());
     tokio::spawn(notify::run());
+    tokio::spawn(handoff::run());
     spawn_popup();
 
     let tray_handle = if args.no_tray
@@ -386,15 +390,7 @@ async fn async_main(
         if is_connected==0 {
             if hub::hub().snapshot().mac.as_deref() == Some(addr_str.as_str()) {
                 info!("AirPods {} disconnected", addr_str);
-                hub::hub().set_command_tx(None);
-                hub::hub().update("disconnected", |s| {
-                    s.connected = false;
-                    s.listening_mode = None;
-                    s.conversational_awareness = None;
-                    s.allow_off = None;
-                    s.headphone = None;
-                    s.in_ear = Default::default();
-                });
+                hub::hub().mark_disconnected();
                 if let Some(handle) = tray_handle.clone() {
                     tokio::spawn(async move {
                         handle

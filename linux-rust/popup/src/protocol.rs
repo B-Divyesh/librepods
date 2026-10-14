@@ -35,6 +35,8 @@ pub struct Device {
     pub in_ear: Option<(bool, bool)>,
     /// The daemon says the AirPods are connected to another device.
     pub elsewhere: Option<bool>,
+    /// They forgot this computer: "waiting" (for pairing mode), "pairing", "failed".
+    pub repair: Option<String>,
 }
 
 /// The events the daemon sends. Unknown names are kept verbatim so they
@@ -53,6 +55,8 @@ pub enum Event {
     Popup,
     /// Toggle the bar dropdown; carries `anchor_x`.
     Menu,
+    /// The pairing recovery moved on (see `Device::repair`).
+    Repair,
     Other(String),
 }
 
@@ -70,6 +74,7 @@ impl Event {
             "low_battery" => Event::LowBattery,
             "popup" => Event::Popup,
             "menu" => Event::Menu,
+            "repair" | "repaired" => Event::Repair,
             other => Event::Other(other.to_string()),
         }
     }
@@ -113,6 +118,7 @@ impl Device {
                     })
                 }
                 "connected_elsewhere" | "elsewhere" | "other_device" => self.elsewhere = v.as_bool(),
+                "repair" => self.repair = nonempty(v),
                 _ => {}
             }
         }
@@ -384,6 +390,7 @@ pub fn demo_device(product: Option<&str>) -> Device {
         allow_off: Some(false),
         in_ear: Some((false, false)),
         elsewhere: None,
+        repair: None,
     };
     if dev.product() == Product::Max {
         dev.left = None;

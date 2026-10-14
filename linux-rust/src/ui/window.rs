@@ -147,6 +147,7 @@ pub enum MacFeelSetting {
     EarPause(bool),
     SwitchOutput(bool),
     HideTrayIcon(bool),
+    HandBack(bool),
     Bluetooth(bool),
 }
 
@@ -830,6 +831,7 @@ impl App {
                     MacFeelSetting::EarPause(v) => m.ear_pause = v,
                     MacFeelSetting::SwitchOutput(v) => m.switch_output_when_removed = v,
                     MacFeelSetting::HideTrayIcon(v) => m.hide_tray_icon = v,
+                    MacFeelSetting::HandBack(v) => m.hand_back_when_idle = v,
                     MacFeelSetting::Bluetooth(on) => {
                         crate::hub::hub().update("status", |s| s.bluetooth_on = on);
                         std::thread::spawn(move || {
@@ -885,7 +887,7 @@ impl App {
                         && let Err(e) = rt.block_on(crate::ipc::bluetoothctl(action, &mac))
                     {
                         error!("{action} {mac} failed: {e}");
-                        if connect {
+                        if connect && !crate::repair::running() {
                             crate::hub::hub().emit("connect_failed");
                         }
                     }
@@ -1212,7 +1214,8 @@ impl App {
                     mac_toggle("Case-Open Card", "Show the battery card with a Connect button when you open the case nearby.", m.case_popup, MacFeelSetting::CasePopup),
                     mac_toggle("Connect When the Case Opens", "Take the AirPods as soon as the lid opens, unless they're busy on another device.", m.auto_connect_on_open, MacFeelSetting::AutoConnectOnOpen),
                     mac_toggle("Connected Card", "Briefly show the battery card whenever the AirPods connect.", m.connect_popup, MacFeelSetting::ConnectPopup),
-                    mac_toggle("Automatic Switching", "When media starts playing here, move the AirPods over from your phone.", m.media_takeover, MacFeelSetting::MediaTakeover),
+                    mac_toggle("Automatic Switching", "When you press play here while wearing them, move the AirPods over from your phone.", m.media_takeover, MacFeelSetting::MediaTakeover),
+                    mac_toggle("Hand Back When Idle", "After two minutes with nothing playing here, let your iPhone have them again.", m.hand_back_when_idle, MacFeelSetting::HandBack),
                     mac_toggle("Pause Media When Removed", "Pause when you take an AirPod out, resume when you put it back.", m.ear_pause, MacFeelSetting::EarPause),
                     mac_toggle("Use Speakers When Not Wearing", "Switch output back to this computer while the AirPods are out of your ears.", m.switch_output_when_removed, MacFeelSetting::SwitchOutput),
                     mac_toggle("Low Battery Alerts", "Notify at 20 % and 10 %, like iPhone and Mac.", m.low_battery_alerts, MacFeelSetting::LowBatteryAlerts),

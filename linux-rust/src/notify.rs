@@ -230,6 +230,59 @@ pub async fn run() {
                 let name = s.name.clone().unwrap_or_else(|| "AirPods".into());
                 toast(format!("\u{f1851}   Couldn't connect to {name}"));
             }
+            "repair" | "repaired" => {
+                // One sticky notification that follows the recovery along
+                // (same sync tag), so it is still there if the card was missed.
+                use crate::hub::RepairState;
+                let name = s.name.clone().unwrap_or_else(|| "AirPods".into());
+                let (summary, body, timeout_ms, urgency) = match (ev.event, s.repair) {
+                    ("repaired", _) => (
+                        format!("{name} paired again"),
+                        "All set — they'll connect to this computer as before.".to_string(),
+                        5000,
+                        1,
+                    ),
+                    (_, Some(RepairState::Waiting)) => (
+                        format!("{name} need to pair again"),
+                        "They forgot this computer. Hold the button on the back of the case \
+                         until the light flashes white — pairing happens by itself."
+                            .to_string(),
+                        0,
+                        2,
+                    ),
+                    (_, Some(RepairState::Pairing)) => (
+                        format!("Pairing {name}…"),
+                        "Keep the case open next to the computer.".to_string(),
+                        0,
+                        1,
+                    ),
+                    (_, Some(RepairState::Failed)) => (
+                        format!("Couldn't pair {name}"),
+                        "Open the case next to the computer, hold the button until the light \
+                         flashes white, then click Try Again on the card (or run \
+                         `librepods ctl repair`)."
+                            .to_string(),
+                        0,
+                        2,
+                    ),
+                    // cancelled
+                    (_, None) => (format!("{name}: pairing cancelled"), String::new(), 2500, 0),
+                };
+                tokio::task::spawn_blocking(move || {
+                    send(Note {
+                        app: APP,
+                        replaces: 0,
+                        icon: icon_path(),
+                        summary,
+                        body,
+                        timeout_ms,
+                        urgency,
+                        sync_tag: Some("librepods-repair"),
+                        value: None,
+                        category: Some("device"),
+                    })
+                });
+            }
             "disconnected" => {
                 low.clear();
                 let _ = connected_note;

@@ -107,7 +107,8 @@ OPTIONS
     --hover ITEM      with --dump --menu: draw mode:N, ca or row:N hovered
     --model M         sample device for --demo/--dump:
                       pro (default), pro1, pro3, 4, 3, 2, max, or 0xID
-    --button STATE    sample button: connect, connecting, connected, failed
+    --button STATE    sample button: connect, connecting, connected, failed,
+                      pair, pairing, pair-failed
     --dump FILE       write a PNG of the card (transparent background)
     --scale S         --dump output scale [default: 2]
     --backdrop        --dump onto a sample wallpaper instead of transparency
@@ -183,6 +184,9 @@ fn parse_args() -> Result<Option<Opts>, String> {
                     "connecting" => ButtonKind::Connecting,
                     "connected" => ButtonKind::Connected,
                     "failed" => ButtonKind::Failed,
+                    "pair" => ButtonKind::PairWait,
+                    "pairing" => ButtonKind::Pairing,
+                    "pair-failed" => ButtonKind::PairFailed,
                     other => return Err(format!("unknown --button state '{other}'")),
                 })
             }
@@ -213,7 +217,7 @@ fn main() -> ExitCode {
     let _instance = if opts.demo {
         None
     } else {
-        match single_instance() {
+        match single_instance(&opts.socket) {
             Some(f) => Some(f),
             None => {
                 eprintln!("librepods-popup: already running in this session");
@@ -235,7 +239,13 @@ fn main() -> ExitCode {
                 }
             }
             Some(ButtonKind::Failed) => app.link = Link::Failed,
+            Some(ButtonKind::PairWait) => app.dev.repair = Some("waiting".into()),
+            Some(ButtonKind::Pairing) => app.dev.repair = Some("pairing".into()),
+            Some(ButtonKind::PairFailed) => app.dev.repair = Some("failed".into()),
             _ => {}
+        }
+        if app.dev.repair.is_some() {
+            app.repair_since = Some(now);
         }
         if app.opts.menu {
             // The dropdown shows its connected state unless asked otherwise.
@@ -333,6 +343,8 @@ struct App {
     /// This connection has already been announced (or was already up when
     /// we started); further `connected` events for it show nothing.
     announced: bool,
+    /// When the current pairing recovery started (drives its spinner).
+    repair_since: Option<Instant>,
     /// Unit tests: decide show/hide without touching Wayland.
     headless: bool,
 }
@@ -347,6 +359,7 @@ impl App {
             opts,
             dev: Device::default(),
             link: Link::Idle,
+            repair_since: None,
             card: None,
             menu: None,
             menu_dirty: false,
@@ -372,6 +385,11 @@ impl App {
 
     fn connecting(&self) -> bool {
         matches!(self.link, Link::Connecting { .. })
+    }
+
+    /// Waiting for pairing mode or pairing: keep the card up and spinning.
+    fn repairing(&self) -> bool {
+        !self.dev.connected && matches!(self.dev.repair.as_deref(), Some("waiting" | "pairing"))
     }
 
     fn locked(&mut self, now: Instant) -> bool {
@@ -732,6 +750,11 @@ impl App {
         };
         let was_connected = self.dev.connected;
         self.dev.apply(&obj);
+        if self.repairing() {
+            self.repair_since.get_or_insert(now);
+        } else {
+            self.repair_since = None;
+        }
         vlog!("event {ev:?} (connected={}, lid={:?})", self.dev.connected, self.dev.lid_open);
 
         if !self.dev.connected {
@@ -780,6 +803,15 @@ impl App {
             Event::Disconnected => {
                 if self.connecting() {
                     self.link = Link::Idle;
+                }
+            }
+            Event::Repair if self.dev.repair.is_some() => {
+                // The daemon has taken over from a failed connect.
+                self.link = Link::Idle;
+                if self.card_up() {
+                    self.touch(now);
+                } else if !self.locked(now) {
+                    self.show(Why::Popup, now);
                 }
             }
             _ => {}
@@ -842,6 +874,12 @@ impl App {
     fn button_kind(&self) -> ButtonKind {
         if self.dev.connected {
             return ButtonKind::Connected;
+        }
+        match self.dev.repair.as_deref() {
+            Some("waiting") => return ButtonKind::PairWait,
+            Some("pairing") => return ButtonKind::Pairing,
+            Some("failed") => return ButtonKind::PairFailed,
+            _ => {}
         }
         match self.link {
             Link::Idle => ButtonKind::Connect,
@@ -950,11 +988,11 @@ impl App {
     fn activate(&mut self, h: Hit, now: Instant) {
         match h {
             Hit::Close => self.hide(now),
-            Hit::Button => {
-                if self.button_kind().clickable() {
-                    self.start_connect(now);
-                }
-            }
+            Hit::Button => match self.button_kind() {
+                ButtonKind::PairFailed => self.start_repair(now),
+                k if k.clickable() => self.start_connect(now),
+                _ => {}
+            },
             Hit::Card => {
                 self.open_app();
                 self.hide(now);
@@ -978,6 +1016,22 @@ impl App {
                     vlog!("connect: {e}");
                     self.link = Link::Failed;
                 }
+            }
+        }
+        self.touch(now);
+        self.dirty = true;
+    }
+
+    /// "Couldn't Pair · Try Again": the daemon waits for pairing mode again.
+    fn start_repair(&mut self, now: Instant) {
+        vlog!("repair requested");
+        if self.opts.demo {
+            self.dev.repair = Some("waiting".into());
+            self.repair_since = Some(now);
+        } else {
+            match ipc::send(&self.opts.socket, CmdKind::Other, "repair", CONNECT_TIMEOUT) {
+                Ok(c) => self.cmds.push(c),
+                Err(e) => vlog!("repair: {e}"),
             }
         }
         self.touch(now);
@@ -1028,7 +1082,7 @@ impl App {
             }
         }
 
-        let connecting = self.connecting();
+        let connecting = self.connecting() || self.repairing();
         let Some(c) = self.card.as_ref() else { return };
         if c.leaving {
             if c.vis.done(now) {
@@ -1055,7 +1109,7 @@ impl App {
             at(Some(deadline));
         }
         if let Some(c) = &self.card {
-            if !c.leaving && !c.hovered && c.pressed.is_none() && !self.connecting() {
+            if !c.leaving && !c.hovered && c.pressed.is_none() && !self.connecting() && !self.repairing() {
                 at(Some(c.last_touch + c.timeout));
             }
             if c.leaving && c.vis.done(now) {
@@ -1125,8 +1179,9 @@ impl App {
             }
             _ => Led::Off,
         };
-        let spin = match self.link {
-            Link::Connecting { since, .. } => now.duration_since(since).as_secs_f32() * render::SPINNER_HZ / 8.0,
+        let spin = match (self.link, self.repair_since) {
+            (_, Some(since)) if self.repairing() => now.duration_since(since).as_secs_f32() * render::SPINNER_HZ / 8.0,
+            (Link::Connecting { since, .. }, _) => now.duration_since(since).as_secs_f32() * render::SPINNER_HZ / 8.0,
             _ => 0.0,
         };
         View {
@@ -1176,13 +1231,15 @@ impl App {
         match res {
             Ok(true) => {
                 self.dirty = false;
-                let next_spin = match self.link {
-                    Link::Connecting { since, .. } if view.button == ButtonKind::Connecting => {
-                        let spokes = now.duration_since(since).as_secs_f32() * render::SPINNER_HZ;
-                        Some(since + Duration::from_secs_f32((spokes.floor() + 1.0) / render::SPINNER_HZ))
-                    }
+                let since = match self.link {
+                    _ if matches!(view.button, ButtonKind::PairWait | ButtonKind::Pairing) => self.repair_since,
+                    Link::Connecting { since, .. } if view.button == ButtonKind::Connecting => Some(since),
                     _ => None,
                 };
+                let next_spin = since.map(|since| {
+                    let spokes = now.duration_since(since).as_secs_f32() * render::SPINNER_HZ;
+                    since + Duration::from_secs_f32((spokes.floor() + 1.0) / render::SPINNER_HZ)
+                });
                 let c = self.card.as_mut().expect("card");
                 c.next_spin = next_spin;
                 c.starved = false;
@@ -1377,15 +1434,24 @@ impl App {
 
 // ────────────────────────────────── misc ────────────────────────────────
 
-fn single_instance() -> Option<std::fs::File> {
+/// One watcher per daemon socket (the real daemon and tests/sim's stand-in
+/// can each have their own).
+fn single_instance(socket: &std::path::Path) -> Option<std::fs::File> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    let lock = if socket == ipc::default_socket() {
+        dir.join("librepods-popup.lock")
+    } else {
+        let mut p = socket.as_os_str().to_owned();
+        p.push(".popup.lock");
+        PathBuf::from(p)
+    };
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(dir.join("librepods-popup.lock"))
+        .open(lock)
         .ok()?;
     // SAFETY: flock on an fd we own.
     let ok = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
@@ -1687,5 +1753,53 @@ mod tests {
         a.on_line(&line("connected", true, true), t + 15 * S);
         assert_eq!(a.button_kind(), ButtonKind::Connected);
         assert_eq!(a.card.as_ref().unwrap().timeout, HUD_FOR, "hides soon after connecting");
+    }
+
+    #[test]
+    fn repair_after_a_connected_session_keeps_the_card() {
+        // The order tests/sim's ui_sim played: card, connect, HUD gone,
+        // disconnect, then the AirPods turn out to have forgotten us.
+        let mut a = app();
+        let t = Instant::now();
+        a.on_line(&line("popup", false, true), t);
+        a.on_line(&line("connecting", false, true), t + S);
+        a.on_line(&line("connected", true, true), t + 2 * S);
+        let t2 = settle(&mut a, t + 2 * S);
+        assert!(!a.card_up());
+        a.on_line(&line("disconnected", false, true), t2 + S);
+        a.on_line(&repair_line(r#""waiting""#), t2 + 2 * S);
+        assert!(a.card_up(), "shown for the repair");
+        a.tick(t2 + 6 * S);
+        a.on_line(&repair_line(r#""pairing""#), t2 + 7 * S);
+        a.tick(t2 + 9 * S);
+        a.tick(t2 + 12 * S);
+        assert!(a.card_up() && !a.card.as_ref().unwrap().leaving, "still up while pairing");
+    }
+
+    fn repair_line(state: &str) -> String {
+        line("repair", false, true).replace(r#""event":"repair","#, &format!(r#""event":"repair","repair":{state},"#))
+    }
+
+    #[test]
+    fn lost_pairing_takes_over_the_card() {
+        let mut a = app();
+        let t = Instant::now();
+        a.on_line(&line("connecting", false, true), t);
+        a.on_line(&repair_line(r#""waiting""#), t + S);
+        assert!(a.card_up(), "a lost pairing brings the card up");
+        assert_eq!(a.button_kind(), ButtonKind::PairWait);
+        assert!(!a.button_kind().clickable());
+        // stays up while waiting for pairing mode, far past the usual timeout
+        a.tick(t + 60 * S);
+        assert!(a.card_up() && !a.card.as_ref().unwrap().leaving);
+        a.on_line(&repair_line(r#""pairing""#), t + 61 * S);
+        assert_eq!(a.button_kind(), ButtonKind::Pairing);
+        a.on_line(&repair_line(r#""failed""#), t + 62 * S);
+        assert_eq!(a.button_kind(), ButtonKind::PairFailed);
+        assert!(a.button_kind().clickable(), "Try Again");
+        a.on_line(&line("repaired", false, true).replace(r#""event":"repaired","#, r#""event":"repaired","repair":null,"#), t + 70 * S);
+        assert_eq!(a.button_kind(), ButtonKind::Connect);
+        a.on_line(&line("connected", true, true), t + 72 * S);
+        assert_eq!(a.button_kind(), ButtonKind::Connected);
     }
 }

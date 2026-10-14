@@ -18,6 +18,10 @@ pub const RETRY: Duration = Duration::from_secs(2);
 const MAX_LINE: usize = 1 << 20;
 
 pub fn default_socket() -> PathBuf {
+    // Same override as the daemon (tests/sim, second instances).
+    if let Some(p) = std::env::var_os("LIBREPODS_SOCKET") {
+        return PathBuf::from(p);
+    }
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));

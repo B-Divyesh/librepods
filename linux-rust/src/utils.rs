@@ -244,6 +244,10 @@ pub struct AppSettings {
     pub switch_output_when_removed: bool,
     /// Hide the StatusNotifier tray icon (e.g. when the Waybar module is used).
     pub hide_tray_icon: bool,
+    /// Plain-Bluetooth handoff: disconnect after this long with no audio
+    /// through the AirPods, so the iPhone can have them (handoff.rs).
+    pub hand_back_when_idle: bool,
+    pub hand_back_after_secs: u32,
 }
 
 impl Default for AppSettings {
@@ -266,6 +270,8 @@ impl Default for AppSettings {
             ear_pause: true,
             switch_output_when_removed: true,
             hide_tray_icon: false,
+            hand_back_when_idle: true,
+            hand_back_after_secs: 120,
         }
     }
 }

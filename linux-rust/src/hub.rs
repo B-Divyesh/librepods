@@ -71,6 +71,17 @@ impl ListeningMode {
     }
 }
 
+/// Where we are in getting AirPods back that forgot this computer (repair.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepairState {
+    /// Waiting for the case to be put in pairing mode.
+    Waiting,
+    Pairing,
+    /// Gave up (timeout or pairing error); `librepods ctl repair` retries.
+    Failed,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Status {
     /// Control channel (AACP) is up with this laptop.
@@ -96,6 +107,12 @@ pub struct Status {
     pub conversational_awareness: Option<bool>,
     pub auto_connect: bool,
     pub bluetooth_on: bool,
+    /// The AirPods forgot this computer and are being paired again.
+    pub repair: Option<RepairState>,
+    /// What their advert says they are doing on the host they're connected
+    /// to (0x04 idle, 0x05 music, 0x06 call, 0x07 ringing; handoff.rs).
+    #[serde(skip)]
+    pub other_state: u8,
     #[serde(skip)]
     pub last_seen: Option<Instant>,
     /// From BLE: whether the left bud is the primary (AACP reports primary first).
@@ -234,6 +251,20 @@ impl Hub {
         } else {
             self.emit("connected");
         }
+    }
+
+    /// The control channel is gone (also when BlueZ dropped the device, which
+    /// the Connected=false watcher in main.rs cannot look up any more).
+    pub fn mark_disconnected(&self) {
+        self.set_command_tx(None);
+        self.update("disconnected", |s| {
+            s.connected = false;
+            s.listening_mode = None;
+            s.conversational_awareness = None;
+            s.allow_off = None;
+            s.headphone = None;
+            s.in_ear = Default::default();
+        });
     }
 
     pub fn emit(&self, event: &'static str) {

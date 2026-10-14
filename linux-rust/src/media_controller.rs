@@ -143,10 +143,17 @@ impl MediaController {
             let local_mac = state.local_mac.clone();
             drop(state);
 
+            // We connected because media started here (switching.rs): that
+            // playback is the user asking for the audio, even though it began
+            // before this connection existed.
+            let asked = crate::handoff::takeover_requested() && is_playing;
+
             if !baseline_taken {
                 baseline_taken = true;
-                debug!("Recorded initial playback state ({is_playing}); not a transition");
-                continue;
+                if !asked {
+                    debug!("Recorded initial playback state ({is_playing}); not a transition");
+                    continue;
+                }
             }
 
             // Losing ownership pauses local players and drops the audio
@@ -163,21 +170,37 @@ impl MediaController {
                 }
             }
 
-            if !was_playing && is_playing {
+            if (!was_playing && is_playing) || asked {
                 // Copy what we need and release the AACP lock right away: the
                 // send_* calls below take the same lock (upstream deadlocked here
                 // whenever the buds reported a second host such as an iPhone).
-                let (in_ear, connected_devices) = {
+                let (in_ear, connected_devices, audio_is_ours) = {
                     let aacp_state = aacp_manager.state.lock().await;
                     (
                         aacp_state
                             .ear_detection_status
                             .contains(&EarDetectionStatus::InEar),
                         aacp_state.connected_devices.clone(),
+                        aacp_state
+                            .audio_source
+                            .as_ref()
+                            .is_some_and(|a| a.mac.eq_ignore_ascii_case(&local_mac)),
                     )
                 };
                 if !in_ear {
-                    info!("Media playback started but buds not in ear, skipping takeover");
+                    // Right after a connect the ear state may not be in yet;
+                    // an asked-for takeover retries on the next poll.
+                    if !asked {
+                        info!("Media playback started but buds not in ear, skipping takeover");
+                    }
+                    continue;
+                }
+                crate::handoff::clear_takeover();
+                // The buds already name us as their audio source: every pause/
+                // play here used to re-send the whole takeover (and yank the
+                // audio back if the phone had just claimed it in between).
+                if audio_is_ours {
+                    debug!("Media playback started; the AirPods' audio is already ours");
                     continue;
                 }
                 if !crate::utils::AppSettings::load().media_takeover {
@@ -218,7 +241,7 @@ impl MediaController {
         }
     }
 
-    fn check_if_playing() -> bool {
+    pub(crate) fn check_if_playing() -> bool {
         let conn = match Connection::new_session() {
             Ok(c) => c,
             Err(_) => return false,
@@ -980,7 +1003,7 @@ impl MediaController {
         }
     }
 
-    fn list_mpris_services(conn: &Connection) -> Vec<String> {
+    pub(crate) fn list_mpris_services(conn: &Connection) -> Vec<String> {
         let proxy = conn.with_proxy(
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",

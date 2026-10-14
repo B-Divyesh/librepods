@@ -93,11 +93,19 @@ pub enum ButtonKind {
     Connecting,
     Connected,
     Failed,
+    /// They forgot this computer; waiting for the case to go into pairing mode.
+    PairWait,
+    Pairing,
+    PairFailed,
 }
 
 impl ButtonKind {
     pub fn clickable(self) -> bool {
-        matches!(self, ButtonKind::Connect | ButtonKind::Failed)
+        matches!(self, ButtonKind::Connect | ButtonKind::Failed | ButtonKind::PairFailed)
+    }
+
+    pub fn spins(self) -> bool {
+        matches!(self, ButtonKind::Connecting | ButtonKind::PairWait | ButtonKind::Pairing)
     }
 }
 
@@ -597,6 +605,28 @@ fn button_look(v: &View) -> ButtonLook {
             style: semibold(red()),
             icon: 0.0,
         },
+        ButtonKind::PairWait => ButtonLook {
+            fill: rgba(0xef, 0xcf, 0x9f, 0.12),
+            text: "Hold Case Button to Pair",
+            style: semibold(gold()),
+            icon: 26.0,
+        },
+        ButtonKind::Pairing => ButtonLook {
+            fill: cream(0.08),
+            text: "Pairing…",
+            style: semibold(text_secondary()),
+            icon: 26.0,
+        },
+        ButtonKind::PairFailed => ButtonLook {
+            fill: match v.button_press {
+                Press::Idle => rgba(0xe5, 0x53, 0x4b, 0.14),
+                Press::Hover => rgba(0xe5, 0x53, 0x4b, 0.22),
+                Press::Down => rgba(0xe5, 0x53, 0x4b, 0.30),
+            },
+            text: "Couldn’t Pair · Try Again",
+            style: semibold(red()),
+            icon: 0.0,
+        },
     }
 }
 
@@ -663,11 +693,12 @@ fn draw_dynamic(pm: &mut PixmapMut, s: f32, v: &View, origin: (i32, i32), swap: 
         }
     }
 
-    if v.button == ButtonKind::Connecting {
+    if v.button.spins() {
         let look = button_look(v);
         let (x0, _) = button_layout(&look);
         let (_, by, _, bh) = BTN;
-        spinner(pm, ts, x0 + 8.0, by + bh * 0.5, v.spin, fix(text_secondary()));
+        let c = if v.button == ButtonKind::PairWait { gold() } else { text_secondary() };
+        spinner(pm, ts, x0 + 8.0, by + bh * 0.5, v.spin, fix(c));
     }
 }
 
