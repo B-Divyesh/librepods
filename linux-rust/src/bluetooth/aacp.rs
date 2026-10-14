@@ -941,10 +941,12 @@ impl AACPManager {
                     keys.push((key_type, key_data));
                     offset += key_length;
                 }
+                // Only the key types and sizes: the IRK and encryption key let
+                // anyone track these AirPods, and logs end up in bug reports.
                 info!(
                     "Received Proximity Keys Response: {:?}",
                     keys.iter()
-                        .map(|(kt, kd)| (kt, hex::encode(kd)))
+                        .map(|(kt, kd)| format!("type {kt}: {} bytes", kd.len()))
                         .collect::<Vec<_>>()
                 );
                 let mut state = self.state.lock().await;
