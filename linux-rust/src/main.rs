@@ -127,6 +127,7 @@ async fn async_main(
 ) -> bluer::Result<()> {
     let args = Args::parse();
     repair::set_runtime(tokio::runtime::Handle::current());
+    bluetooth::trace::init();  // opens LIBREPODS_AACP_TRACE now, if set, so it is confirmed at startup
 
     let mut managed_devices_mac: Vec<String> = Vec::new(); // includes ony non-AirPods. AirPods handled separately.
 

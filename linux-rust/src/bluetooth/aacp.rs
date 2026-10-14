@@ -609,6 +609,7 @@ impl AACPManager {
             }
         };
         if let Some(sender) = sender {
+            crate::bluetooth::trace::record(crate::bluetooth::trace::Dir::Tx, data);
             sender.send(data.to_vec()).await.map_err(|e| {
                 error!("Failed to send packet to channel: {}", e);
                 Error::from(std::io::Error::new(
@@ -1431,6 +1432,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 }
 
                 debug!("Received {} bytes: {}", n, hex::encode(data));
+                crate::bluetooth::trace::record(crate::bluetooth::trace::Dir::Rx, data);
                 manager.receive_packet(data).await;
             }
             Err(e) => {

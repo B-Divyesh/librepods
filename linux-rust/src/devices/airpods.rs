@@ -85,6 +85,21 @@ impl AirPodsDevice {
                 .await;
         }
 
+        // Experimental (librepods#782): on firmware 9A348 the control link is
+        // dropped ~40 s after connecting in Apple-Device-ID mode. The core
+        // handshake already matches macOS; LIBREPODS_AACP_STRICT=1 additionally
+        // sends *only* the documented third-party sequence — handshake,
+        // host-capabilities (0x4D), notification register (0x0F) — and skips
+        // the extra 0x29 capability packet and the eager BLE-key request, both
+        // of which that firmware is suspected to object to. Trade-off: BLE
+        // address resolution won't refresh until the next reconnect, so
+        // nearby/advert battery may lag while connected. Capture the result
+        // with LIBREPODS_AACP_TRACE to see whether the link stays up.
+        let strict = std::env::var_os("LIBREPODS_AACP_STRICT").is_some();
+        if strict {
+            info!("AACP strict handshake (experimental): documented macOS sequence only");
+        }
+
         info!("Sending handshake");
         if let Err(e) = aacp_manager.send_handshake().await {
             error!("Failed to send handshake to AirPods device: {}", e);
@@ -104,17 +119,21 @@ impl AirPodsDevice {
             error!("Failed to request notifications: {}", e);
         }
 
-        info!("sending some packet");
-        if let Err(e) = aacp_manager.send_some_packet().await {
-            error!("Failed to send some packet: {}", e);
-        }
+        if !strict {
+            info!("sending some packet");
+            if let Err(e) = aacp_manager.send_some_packet().await {
+                error!("Failed to send some packet: {}", e);
+            }
 
-        info!("Requesting Proximity Keys: IRK and ENC_KEY");
-        if let Err(e) = aacp_manager
-            .send_proximity_keys_request(vec![ProximityKeyType::Irk, ProximityKeyType::EncKey])
-            .await
-        {
-            error!("Failed to request proximity keys: {}", e);
+            info!("Requesting Proximity Keys: IRK and ENC_KEY");
+            if let Err(e) = aacp_manager
+                .send_proximity_keys_request(vec![ProximityKeyType::Irk, ProximityKeyType::EncKey])
+                .await
+            {
+                error!("Failed to request proximity keys: {}", e);
+            }
+        } else {
+            info!("strict: skipping the 0x29 capability packet and the eager BLE-key request");
         }
 
         let app_settings_path = get_app_settings_path();

@@ -1,6 +1,7 @@
 pub mod aacp;
 pub mod aacp_audio;
 pub mod att;
+pub mod trace;
 pub(crate) mod discovery;
 pub mod le;
 pub mod managers;
