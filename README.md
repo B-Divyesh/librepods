@@ -1,3 +1,14 @@
+> **This is the `macfeel` branch of a LibrePods fork** — the Linux Rust app
+> (`linux-rust/`) with a Mac-style desktop integration on top of upstream's
+> `linux/rust`: a case-open card and a menu-bar dropdown for Wayland
+> (`linux-rust/popup/`), a control socket and `librepods ctl` CLI with a Waybar
+> module, automatic recovery when the AirPods forget this computer, iPhone
+> handoff without iCloud, upstream PRs #655, #724, #766 and #775 merged, and an
+> AirPods simulator for testing (`linux-rust/tests/sim/`). Installer, configs,
+> screenshots and the reasoning behind it:
+> **[B-Divyesh/airpods-macfeel](https://github.com/B-Divyesh/airpods-macfeel)**.
+> Everything below is upstream's README.
+
 ![LibrePods Banner](/imgs/banner.png)
 
 [![XDA Thread](https://img.shields.io/badge/XDA_Forums-Thread-orange)](https://xdaforums.com/t/app-root-for-now-airpodslikenormal-unlock-apple-exclusive-airpods-features-on-android.4707585/)
